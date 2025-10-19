@@ -1,9 +1,5 @@
-streamlit==1.24.0
-pandas==2.0.3
-numpy==1.24.3
-sentence-transformers==2.2.2
---find-links https://download.pytorch.org/whl/cpu
-torch==2.0.0+cpu
+-c conda-forge
+conda-env-export
 scikit-learn==1.0.2
 huggingface_hub==0.15.1
 requests==2.28.2

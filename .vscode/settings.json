@@ -1,0 +1,14 @@
+{
+    // Reduce noisy 'missing import' warnings when the workspace doesn't have the project's virtualenv activated.
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingImports": "none",
+        "reportMissingModuleSource": "none"
+    },
+    // Allow the language server to resolve imports from the workspace root
+    "python.analysis.extraPaths": [
+        "./"
+    ]
+    ,
+    // Disable Pyright type checking for this workspace to avoid the "code is too complex to analyze" warning
+    "python.analysis.typeCheckingMode": "off"
+}

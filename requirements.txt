@@ -1,6 +1,8 @@
+setuptools>=65.5.1
+wheel>=0.38.4
 streamlit==1.24.0
-pandas==1.5.3
-numpy==1.24.3
+pandas==1.5.3 --no-build-isolation
+numpy==1.24.3 --no-build-isolation
 openpyxl==3.1.2
 sentence-transformers==2.2.2
 transformers==4.30.2

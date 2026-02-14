@@ -1,0 +1,18 @@
+{
+  "users": {
+    "admin": {
+      "history": [],
+      "api_keys": {
+        "Google Gemini": "AIzaSyC6budaEDwCSkWL_SYj2bNRPr37SBb_DJM"
+      },
+      "current": {
+        "gpt_system_prompt": "",
+        "gpt_user_template": "",
+        "gpt_temperature": 0.0,
+        "gpt_top_p": 1.0,
+        "gpt_max_tokens": 20,
+        "matching_method": "Google Gemini"
+      }
+    }
+  }
+}

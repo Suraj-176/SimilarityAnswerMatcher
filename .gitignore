@@ -54,11 +54,6 @@ htmlcov/
 .env.local
 .env.*.local
 
-# JSON files (credentials/sensitive data)
-.auth_sessions.json
-.gpt_settings.json
-.users.json
-
 # Logs
 error_log.txt
 *.log

@@ -1,4 +1,4 @@
-﻿streamlit
+streamlit
 pandas
 openpyxl
 sentence-transformers==2.2.2

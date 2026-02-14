@@ -42,7 +42,6 @@ MANIFEST
 htmlcov/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo

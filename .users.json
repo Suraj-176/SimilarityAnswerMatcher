@@ -40,13 +40,13 @@
       "last_name": "dummy",
       "email": "user.dummy@gmail.com",
       "role": "user",
-      "password_hash": "ef825bc73d2655b14077f8718f2b8a52866555dba4228fd01abe9fdf2783921e",
-      "salt": "042c7d4bfdbecb312ac4fa0193e0d39c",
+      "password_hash": "80f5b94bbd73cbd23a17473685fa4ad398d4d32005d97d26e2ae5c6665166a9b",
+      "salt": "8c9c6e2965919a35f6e5b9b0f2c39455",
       "must_change_password": false,
       "temporary_password_active": false,
       "created_at": "2026-02-14T18:51:35Z",
-      "updated_at": "2026-02-14T21:33:46Z",
-      "theme": "dark",
+      "updated_at": "2026-02-15T08:33:09Z",
+      "theme": "light",
       "allow_password_reset": true
     }
   }

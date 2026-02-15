@@ -44,20 +44,28 @@ class AIProvider(ABC):
             content_str = str(content).strip()
             logger.debug("Extracting score from: %s", content_str[:100])
 
-            # Try to find a percentage (0-100)
-            m = re.search(r"\b(\d{1,3})(?:\.\d+)?%?\b", content_str)
-            if m:
-                score = float(m.group(1))
+            # First preference: explicit percentages like "87%" or "87.5%".
+            pct_matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", content_str)
+            for token in reversed(pct_matches):
+                score = float(token)
                 if 0 <= score <= 100:
-                    logger.debug("Extracted score: %s", score)
+                    logger.debug("Extracted percent score: %s", score)
                     return score
 
-            # Try to find any decimal number
-            m = re.search(r"\d+(?:\.\d+)?", content_str)
-            if m:
-                score = float(m.group(0))
+            # Fallback: plain numbers.
+            # Use the last valid number, because models often include context before final answer.
+            num_matches = re.findall(r"-?\d+(?:\.\d+)?", content_str)
+            for token in reversed(num_matches):
+                score = float(token)
+                if score < 0:
+                    continue
+                # Many models return a ratio in [0, 1]. Convert to percentage.
+                if 0 <= score <= 1 and "." in token:
+                    converted = round(score * 100, 2)
+                    logger.debug("Extracted ratio score %s -> %s%%", score, converted)
+                    return converted
                 if 0 <= score <= 100:
-                    logger.debug("Extracted score: %s", score)
+                    logger.debug("Extracted numeric score: %s", score)
                     return score
 
             # Fallback: extract digits
@@ -460,7 +468,7 @@ def get_provider(provider_name: str, api_key: str) -> AIProvider:
         "OpenRouter (API)": "OpenRouter",
         "OpenAI GPT-4o (API)": "OpenAI GPT-4o",
         "Azure OpenAI GPT-4o (API)": "Azure OpenAI GPT-4o",
-        "OpenAI GPT-4o-mini": "OpenAI GPT-4o",
+        "OpenAI GPT-4o-mini": "OpenAI GPT-4o-mini",
     }
     provider_name = aliases.get(provider_name, provider_name)
     if provider_name not in PROVIDERS:

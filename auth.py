@@ -11,11 +11,12 @@ import streamlit as st
 
 USERS_DB_PATH = os.path.join(os.getcwd(), ".users.json")
 AUTH_SESSIONS_DB_PATH = os.path.join(os.getcwd(), ".auth_sessions.json")
-DEFAULT_TEMP_PASSWORD = os.getenv("DEFAULT_TEMP_PASSWORD", "Temp@123")
 PASSWORD_MIN_LENGTH = 8
 SYSTEM_ADMIN_USERNAME = "admin"
 SYSTEM_ADMIN_PASSWORD = "System@123"
 SESSION_IDLE_TIMEOUT_SECONDS = int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "1800"))
+TEMP_PASSWORD_PREFIX = "Temp"
+TEMP_PASSWORD_SPECIALS = "@#$%&*!"
 
 
 def _utc_now_iso() -> str:
@@ -27,7 +28,9 @@ class AuthManager:
 
     def __init__(self):
         self._init_session_state()
-        self._ensure_user_store()
+        if not st.session_state.get("_auth_store_checked", False):
+            self._ensure_user_store()
+            st.session_state._auth_store_checked = True
 
     def _init_session_state(self):
         if "authenticated" not in st.session_state:
@@ -70,6 +73,16 @@ class AuthManager:
             st.session_state.user_theme = "light"
         if "auth_token" not in st.session_state:
             st.session_state.auth_token = None
+        if "_auth_store_checked" not in st.session_state:
+            st.session_state._auth_store_checked = False
+        if "forgot_username_hint" not in st.session_state:
+            st.session_state.forgot_username_hint = ""
+        if "forgot_generated_temp_password" not in st.session_state:
+            st.session_state.forgot_generated_temp_password = ""
+        if "forgot_generated_message" not in st.session_state:
+            st.session_state.forgot_generated_message = ""
+        if "_auth_last_persist_sync" not in st.session_state:
+            st.session_state._auth_last_persist_sync = 0.0
 
     def hash_password(self, password: str, salt: str = None) -> tuple[str, str]:
         if salt is None:
@@ -196,15 +209,20 @@ class AuthManager:
         token = (st.session_state.get("auth_token") or self._get_query_session_token() or "").strip()
         if not token:
             return
+        now = time.time()
+        last_sync = float(st.session_state.get("_auth_last_persist_sync", 0.0) or 0.0)
+        if (now - last_sync) < 15:
+            return
         store = self._load_auth_sessions()
         sessions = store.setdefault("sessions", {})
         entry = sessions.get(token)
         if not isinstance(entry, dict):
             return
-        entry["last_activity_ts"] = time.time()
+        entry["last_activity_ts"] = now
         entry["updated_at"] = _utc_now_iso()
         sessions[token] = entry
-        self._save_auth_sessions(store)
+        if self._save_auth_sessions(store):
+            st.session_state._auth_last_persist_sync = now
 
     def _restore_persistent_session(self) -> bool:
         token = self._get_query_session_token()
@@ -487,7 +505,10 @@ class AuthManager:
         if not target_user.get("allow_password_reset", True):
             return False, "", "Password reset is disabled for this user."
 
-        temp_password = DEFAULT_TEMP_PASSWORD
+        temp_password = self._generate_temporary_password(
+            current_hash=target_user.get("password_hash", ""),
+            current_salt=target_user.get("salt", ""),
+        )
         password_hash, salt = self.hash_password(temp_password)
         users[target_key]["password_hash"] = password_hash
         users[target_key]["salt"] = salt
@@ -499,6 +520,17 @@ class AuthManager:
             return False, "", "Password reset failed while saving."
 
         return True, temp_password, "Temporary password generated."
+
+    def _generate_temporary_password(self, current_hash: str = "", current_salt: str = "") -> str:
+        digits = "0123456789"
+        for _ in range(20):
+            special = secrets.choice(TEMP_PASSWORD_SPECIALS)
+            numeric = "".join(secrets.choice(digits) for _ in range(4))
+            candidate = f"{TEMP_PASSWORD_PREFIX}{special}{numeric}"
+            if current_hash and current_salt and self.verify_password(candidate, current_hash, current_salt):
+                continue
+            return candidate
+        return f"{TEMP_PASSWORD_PREFIX}@{secrets.randbelow(9000) + 1000}"
 
     def change_password(self, current_password: str, new_password: str, confirm_password: str) -> tuple[bool, str]:
         if not st.session_state.get("authenticated"):
@@ -546,7 +578,10 @@ class AuthManager:
         if not user_key:
             return False, "Invalid user session."
 
-        users, store = self._ensure_user_store()
+        store = self._load_user_store()
+        users = store.setdefault("users", {})
+        if not users:
+            users, store = self._ensure_user_store()
         user_entry = users.get(user_key)
         if not user_entry:
             return False, "User record not found."
@@ -561,103 +596,67 @@ class AuthManager:
 
     def apply_user_theme(self):
         theme = (st.session_state.get("user_theme") or "light").strip().lower()
-        if theme != "dark":
-            return
-        st.markdown(
-            """
+        if theme == "dark":
+            css = """
             <style>
-            .stApp, .main {
-                background: linear-gradient(135deg, #0b1220, #111827) !important;
-                color: #e5e7eb !important;
-            }
-            .header-card {
-                background: transparent !important;
-            }
-            .header-title, .step-title, h1, h2, h3, h4, h5, h6, label,
-            [data-testid="stMarkdownContainer"] p,
-            [data-testid="stMarkdownContainer"] li,
-            [data-testid="stCaptionContainer"] p {
-                color: #e5e7eb !important;
-            }
-            .header-subtitle {
-                color: #cbd5e1 !important;
-            }
-            .step-card, .auth-card, .info-box, .stDataFrame, .stAlert, [data-testid="stForm"] {
-                background: #111827 !important;
-                border-color: #334155 !important;
-            }
-            .step-card.small {
-                background: #111827 !important;
-                border-color: #334155 !important;
-            }
-            .step-number {
-                background: #1e293b !important;
-                color: #e5e7eb !important;
-                border: 1px solid #475569 !important;
-            }
-            .step2-field-label {
-                color: #e5e7eb !important;
-            }
-            .info-box {
-                color: #cbd5e1 !important;
-                border-color: #334155 !important;
-                background: #0f172a !important;
-            }
-            .stSelectbox > div > div {
-                background: #0f172a !important;
-                border: 1px solid #334155 !important;
-            }
-            .stSelectbox > div > div * {
-                color: #e5e7eb !important;
-                fill: #e5e7eb !important;
-            }
-            [data-testid="stFileUploaderDropzone"],
-            [data-testid="stFileUploaderDropzone"] * {
-                background: #0f172a !important;
-                color: #e5e7eb !important;
-                border-color: #334155 !important;
-            }
-            .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stNumberInput input {
-                background: #0f172a !important;
-                color: #e5e7eb !important;
-                border-color: #334155 !important;
-            }
-            .stTextInput input::placeholder, .stTextArea textarea::placeholder {
-                color: #94a3b8 !important;
-                opacity: 1 !important;
-            }
-            .stSelectbox div[data-baseweb="select"] *, .stSelectbox svg {
-                color: #e5e7eb !important;
-                fill: #e5e7eb !important;
-            }
-            div[data-baseweb="menu"], ul[role="listbox"] {
-                background: #0f172a !important;
-                color: #e5e7eb !important;
-                border: 1px solid #334155 !important;
-            }
-            div[data-baseweb="menu"] *, ul[role="listbox"] * {
-                color: #e5e7eb !important;
-            }
-            div[data-baseweb="popover"], div[data-baseweb="popover"] * {
-                background: #111827 !important;
-                color: #e5e7eb !important;
-                border-color: #334155 !important;
-            }
-            .stButton button[kind="primary"], .stButton button[kind="secondary"], .stFormSubmitButton button {
-                background: #1e293b !important;
-                color: #e5e7eb !important;
-                border: 1px solid #475569 !important;
-            }
-            a {
-                color: #7dd3fc !important;
-            }
-            [data-testid="stCaptionContainer"] p, small {
-                color: #cbd5e1 !important;
-            }
+            .stApp, .main { background: linear-gradient(135deg, #0b1220, #111827) !important; color: #e5e7eb !important; }
+            .header-card { background: transparent !important; }
+            .header-title, .step-title, h1, h2, h3, h4, h5, h6, label, [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li, [data-testid="stCaptionContainer"] p { color: #e5e7eb !important; }
+            .header-subtitle { color: #cbd5e1 !important; }
+            .step-card, .auth-card, .info-box, .stDataFrame, .stAlert, [data-testid="stForm"] { background: #111827 !important; border-color: #334155 !important; }
+            .step-card.small { background: #111827 !important; border-color: #334155 !important; }
+            .step-number { background: #1e293b !important; color: #e5e7eb !important; border: 1px solid #475569 !important; }
+            .step2-field-label { color: #e5e7eb !important; }
+            .info-box { color: #cbd5e1 !important; border-color: #334155 !important; background: #0f172a !important; }
+            .stSelectbox > div > div { background: #0f172a !important; border: 1px solid #334155 !important; }
+            .stSelectbox > div > div * { color: #e5e7eb !important; fill: #e5e7eb !important; }
+            [data-testid="stFileUploaderDropzone"], [data-testid="stFileUploaderDropzone"] * { background: #0f172a !important; color: #e5e7eb !important; border-color: #334155 !important; }
+            .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stNumberInput input { background: #0f172a !important; color: #e5e7eb !important; border-color: #334155 !important; }
+            .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #94a3b8 !important; opacity: 1 !important; }
+            .stSelectbox div[data-baseweb="select"] *, .stSelectbox svg { color: #e5e7eb !important; fill: #e5e7eb !important; }
+            div[data-baseweb="menu"], ul[role="listbox"] { background: #0f172a !important; color: #e5e7eb !important; border: 1px solid #334155 !important; }
+            div[data-baseweb="menu"] *, ul[role="listbox"] * { color: #e5e7eb !important; }
+            div[data-baseweb="popover"], div[data-baseweb="popover"] * { background: #111827 !important; color: #e5e7eb !important; border-color: #334155 !important; }
+            [data-testid="stDialog"] [role="dialog"], div[role="dialog"] { background: #111827 !important; color: #e5e7eb !important; border: 1px solid #334155 !important; }
+            [data-testid="stDialog"] h1, [data-testid="stDialog"] h2, [data-testid="stDialog"] h3, div[role="dialog"] h1, div[role="dialog"] h2, div[role="dialog"] h3, [data-testid="stDialog"] label, [data-testid="stDialog"] p, [data-testid="stDialog"] span, div[role="dialog"] label, div[role="dialog"] p, div[role="dialog"] span, [data-testid="stDialog"] [data-testid="stMarkdownContainer"] * { color: #e5e7eb !important; }
+            [data-testid="stDialog"] button[aria-label="Close"] { color: #e5e7eb !important; }
+            [data-testid="stDialog"] [data-testid="stAlertContainer"] { background: #1f2937 !important; border-color: #334155 !important; }
+            .stButton button[kind="primary"], .stButton button[kind="secondary"], .stFormSubmitButton button { background: #1e293b !important; color: #e5e7eb !important; border: 1px solid #475569 !important; }
+            a { color: #7dd3fc !important; }
+            [data-testid="stCaptionContainer"] p, small { color: #cbd5e1 !important; }
             </style>
-            """,
-            unsafe_allow_html=True,
-        )
+            """
+        else:
+            css = """
+            <style>
+            .stApp, .main { background: linear-gradient(to bottom right, #f8fafc, #eff6ff) !important; color: #0f172a !important; }
+            .header-card { background: transparent !important; }
+            .header-title, .step-title, h1, h2, h3, h4, h5, h6, label, [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li, [data-testid="stCaptionContainer"] p { color: #0f172a !important; }
+            .header-subtitle { color: #334155 !important; }
+            .step-card, .auth-card, .stDataFrame, .stAlert, [data-testid="stForm"] { background: #ffffff !important; border-color: #e2e8f0 !important; }
+            .step-card.small { background: #ffffff !important; border-color: #e2e8f0 !important; }
+            .step-number { background: #f1f5f9 !important; color: #0f172a !important; border: 1px solid #dbe3ee !important; }
+            .step2-field-label { color: #0f172a !important; }
+            .info-box { color: #1e3a8a !important; border-color: #bfdbfe !important; background: #eff6ff !important; }
+            .stSelectbox > div > div { background: #e3f2fd !important; border: 1px solid #dbe3ee !important; }
+            .stSelectbox > div > div * { color: #0f172a !important; fill: #0f172a !important; }
+            [data-testid="stFileUploaderDropzone"], [data-testid="stFileUploaderDropzone"] * { background: #ffffff !important; color: #0f172a !important; border-color: #e2e8f0 !important; }
+            .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stNumberInput input { background: #ffffff !important; color: #0f172a !important; border-color: #c9d7e8 !important; }
+            .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #64748b !important; opacity: 1 !important; }
+            .stSelectbox div[data-baseweb="select"] *, .stSelectbox svg { color: #0f172a !important; fill: #0f172a !important; }
+            div[data-baseweb="menu"], ul[role="listbox"] { background: #ffffff !important; color: #0f172a !important; border: 1px solid #dbe3ee !important; }
+            div[data-baseweb="menu"] *, ul[role="listbox"] * { color: #0f172a !important; }
+            div[data-baseweb="popover"], div[data-baseweb="popover"] * { background: #ffffff !important; color: #0f172a !important; border-color: #e2e8f0 !important; }
+            [data-testid="stDialog"] [role="dialog"], div[role="dialog"] { background: #ffffff !important; color: #0f172a !important; border: 1px solid #dbe3ee !important; }
+            [data-testid="stDialog"] h1, [data-testid="stDialog"] h2, [data-testid="stDialog"] h3, div[role="dialog"] h1, div[role="dialog"] h2, div[role="dialog"] h3, [data-testid="stDialog"] label, [data-testid="stDialog"] p, [data-testid="stDialog"] span, div[role="dialog"] label, div[role="dialog"] p, div[role="dialog"] span, [data-testid="stDialog"] [data-testid="stMarkdownContainer"] * { color: #0f172a !important; }
+            [data-testid="stDialog"] button[aria-label="Close"] { color: #0f172a !important; }
+            [data-testid="stDialog"] [data-testid="stAlertContainer"] { background: #f8fafc !important; border-color: #e2e8f0 !important; }
+            .stButton button[kind="primary"], .stButton button[kind="secondary"], .stFormSubmitButton button { background: #f8fafc !important; color: #0f172a !important; border: 1px solid #cbd5e1 !important; }
+            a { color: #0369a1 !important; }
+            [data-testid="stCaptionContainer"] p, small { color: #475569 !important; }
+            </style>
+            """
+        st.markdown(css, unsafe_allow_html=True)
 
     def authenticate(self, username: str, password: str) -> bool:
         success, role_or_error = self.authenticate_user(username, password)
@@ -877,6 +876,9 @@ class AuthManager:
                 forgot_click = st.form_submit_button("Forgot Password", use_container_width=True)
 
             if forgot_click:
+                st.session_state.forgot_username_hint = (username or "").strip()
+                st.session_state.forgot_generated_temp_password = ""
+                st.session_state.forgot_generated_message = ""
                 st.session_state.show_forgot_password = True
                 st.rerun()
 
@@ -887,11 +889,12 @@ class AuthManager:
                     success, role_or_error = self.authenticate_user(username, password)
                     if success:
                         st.session_state.show_forgot_password = False
+                        st.session_state.forgot_generated_temp_password = ""
+                        st.session_state.forgot_generated_message = ""
                         if st.session_state.get("password_reset_required"):
                             st.warning("Temporary password detected. Reset password to continue.")
                         else:
                             st.success("Login successful. Redirecting...")
-                        time.sleep(0.5)
                         st.rerun()
                     else:
                         st.error(role_or_error)
@@ -904,27 +907,47 @@ class AuthManager:
                 st.warning(f"{remaining_attempts} attempts remaining.")
 
         if st.session_state.get("show_forgot_password", False):
-            st.markdown("<div class='auth-small-note'>Reset password using username/email.</div>", unsafe_allow_html=True)
-            with st.form("forgot_password_form"):
-                identifier = st.text_input("Username or Email", placeholder="Enter username or email")
-                reset_col, cancel_col = st.columns([1, 1], gap="small")
-                with reset_col:
-                    reset_submit = st.form_submit_button("Generate Temporary Password", use_container_width=True)
-                with cancel_col:
-                    cancel_submit = st.form_submit_button("Cancel", use_container_width=True)
-                if cancel_submit:
-                    st.session_state.show_forgot_password = False
-                    st.rerun()
-                if reset_submit:
-                    ok, temp_password, msg = self.issue_temporary_password(identifier)
-                    if ok:
-                        st.success(f"{msg} Temporary password: {temp_password}")
-                        st.info("Login with the temporary password. You will be prompted to set a new password.")
-                    else:
+            @st.dialog("Forgot Password")
+            def _forgot_password_dialog():
+                st.caption("Reset password using username or email.")
+                generated_temp = st.session_state.get("forgot_generated_temp_password", "")
+                if generated_temp:
+                    st.success(st.session_state.get("forgot_generated_message", "Temporary password generated."))
+                    st.code(generated_temp)
+                    st.info("Use this temporary password to log in. You will be asked to set a new password.")
+                    st.caption("Close this dialog using the X button.")
+                    return
+
+                with st.form("forgot_password_dialog_form"):
+                    identifier = st.text_input(
+                        "Username or Email",
+                        value=st.session_state.get("forgot_username_hint", ""),
+                        placeholder="Enter username or email",
+                    )
+                    reset_col, cancel_col = st.columns([1.25, 0.75], gap="small")
+                    with reset_col:
+                        reset_submit = st.form_submit_button("Generate Temp", use_container_width=True)
+                    with cancel_col:
+                        cancel_submit = st.form_submit_button("Cancel", use_container_width=True)
+                    if cancel_submit:
+                        st.session_state.show_forgot_password = False
+                        st.session_state.forgot_generated_temp_password = ""
+                        st.session_state.forgot_generated_message = ""
+                        st.rerun()
+                    if reset_submit:
+                        ok, temp_password, msg = self.issue_temporary_password(identifier)
+                        if ok:
+                            st.session_state.forgot_generated_temp_password = temp_password
+                            st.session_state.forgot_generated_message = msg
+                            st.rerun()
                         st.error(msg)
+
+            _forgot_password_dialog()
 
     def _render_signup_tab(self):
         st.session_state.show_forgot_password = False
+        st.session_state.forgot_generated_temp_password = ""
+        st.session_state.forgot_generated_message = ""
         with st.form("signup_form"):
             username = st.text_input("Username", placeholder="Choose username")
             first_name = st.text_input("First Name", placeholder="Enter first name")
@@ -1003,7 +1026,6 @@ class AuthManager:
                     ok, msg = self.change_password(current_password, new_password, confirm_password)
                     if ok:
                         st.success(msg)
-                        time.sleep(0.6)
                         st.rerun()
                     else:
                         st.error(msg)
@@ -1096,6 +1118,14 @@ def check_authentication() -> bool:
         auth_manager._restore_persistent_session()
 
     if st.session_state.authenticated:
+        # Apply any pending profile theme toggle before rendering CSS/UI so theme switch is single-pass.
+        pending_theme_label = st.session_state.get("profile_theme_radio_inline")
+        if pending_theme_label in ("Light", "Dark"):
+            pending_theme = pending_theme_label.lower()
+            current_saved_theme = (st.session_state.get("user_theme") or "light").strip().lower()
+            if pending_theme != current_saved_theme:
+                auth_manager.set_user_theme(pending_theme)
+
         if not auth_manager.check_session_timeout():
             return False
 
@@ -1129,6 +1159,7 @@ def show_user_info():
 
     username = st.session_state.get("username") or "user"
     auth_mgr = AuthManager()
+    theme_widget_key = "profile_theme_radio_inline"
 
     feedback = st.session_state.get("auth_feedback")
     if isinstance(feedback, dict):
@@ -1148,101 +1179,99 @@ def show_user_info():
     safe_user = html.escape(str(username))
     is_dark = current_theme == "dark"
 
-    panel_bg = "#0f172a" if is_dark else "#ffffff"
     panel_text = "#e5e7eb" if is_dark else "#0f172a"
     panel_subtext = "#cbd5e1" if is_dark else "#64748b"
     panel_border = "#334155" if is_dark else "#dbe3ee"
-    theme_widget_key = "profile_theme_radio_inline"
     if theme_widget_key not in st.session_state:
         st.session_state[theme_widget_key] = "Dark" if current_theme == "dark" else "Light"
-    layout_shift_css = ""
-    if st.session_state.get("profile_menu_open", False):
-        layout_shift_css = """
-        .main .block-container {
-            padding-right: 360px !important;
-            transition: padding-right 0.18s ease;
-        }
-        @media (max-width: 1200px) {
-            .main .block-container {
-                padding-right: 1rem !important;
-            }
-        }
-        """
 
     st.markdown(
         f"""
         <style>
-        .st-key-profile_icon_toggle_btn button {{
+        .st-key-profile_popover_anchor {{
             position: fixed !important;
             right: 18px !important;
             bottom: 18px !important;
             z-index: 1400 !important;
+            width: 64px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            left: auto !important;
+        }}
+        .st-key-profile_popover_anchor > div {{
+            width: 100% !important;
+            display: flex !important;
+            justify-content: flex-end !important;
+        }}
+        .st-key-profile_popover_anchor [data-testid="stPopoverButton"] button {{
             min-height: 46px !important;
             height: 46px !important;
             width: 46px !important;
             border-radius: 999px !important;
             border: 1px solid {panel_border} !important;
-            background: {panel_bg} !important;
+            background: {"#0f172a" if is_dark else "#ffffff"} !important;
             color: {panel_text} !important;
             box-shadow: 0 10px 24px rgba(15, 23, 42, 0.26) !important;
             padding: 0 !important;
             font-size: 20px !important;
             line-height: 1 !important;
         }}
-        .profile-floating-panel {{
-            position: fixed;
-            right: 18px;
-            bottom: 74px;
-            width: 300px;
-            z-index: 1390;
-            background: {panel_bg};
-            color: {panel_text};
-            border: 1px solid {panel_border};
-            border-radius: 12px;
-            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.24);
-            min-height: 238px;
-            max-height: calc(100vh - 110px);
-            overflow-y: auto;
-            padding: 14px;
+        .st-key-profile_popover_anchor [data-baseweb="popover"] {{
+            min-width: 280px !important;
+            border: 1px solid {panel_border} !important;
         }}
-        .profile-floating-panel .user-row {{
-            font-size: 1.1rem;
-            font-weight: 700;
-            margin-bottom: 12px;
-            color: {panel_text};
+        .st-key-profile_user_label {{
+            margin: 0 0 0.35rem 0 !important;
+            color: {panel_text} !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
         }}
-        .profile-floating-panel .theme-label {{
-            font-size: 0.92rem;
-            color: {panel_subtext};
-            margin-bottom: 8px;
+        .st-key-profile_theme_label {{
+            margin: 0.1rem 0 0.4rem 0 !important;
+            color: {panel_subtext} !important;
+            font-size: 0.9rem !important;
+            font-weight: 600 !important;
         }}
         .st-key-profile_theme_radio_inline,
         [class*="st-key-profile_theme_radio_inline"] {{
-            position: fixed !important;
-            right: 30px !important;
-            bottom: 194px !important;
-            width: 268px !important;
-            z-index: 1395 !important;
+            margin-bottom: 0.45rem !important;
+        }}
+        .st-key-profile_theme_radio_inline [data-testid="stWidgetLabel"],
+        [class*="st-key-profile_theme_radio_inline"] [data-testid="stWidgetLabel"] {{
+            display: none !important;
+            height: 0 !important;
             margin: 0 !important;
             padding: 0 !important;
         }}
-        .st-key-profile_theme_radio_inline [data-testid="stRadio"] > div,
-        [class*="st-key-profile_theme_radio_inline"] [data-testid="stRadio"] > div {{
+        .st-key-profile_theme_radio_inline div[role="radiogroup"],
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] {{
             display: flex !important;
             flex-direction: row !important;
             gap: 8px !important;
             flex-wrap: nowrap !important;
         }}
-        .st-key-profile_theme_radio_inline [data-testid="stRadio"] label,
-        [class*="st-key-profile_theme_radio_inline"] [data-testid="stRadio"] label {{
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] label,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label {{
+            display: flex !important;
+            align-items: center !important;
+            gap: 0.35rem !important;
             min-height: 26px !important;
             height: 26px !important;
-            padding: 0.14rem 0.5rem !important;
+            padding: 0.14rem 0.7rem !important;
             border-radius: 8px !important;
             border: 1px solid {panel_border} !important;
-            background: {"#111827" if is_dark else "#f8fafc"} !important;
+            background: {"#1f2937" if is_dark else "#f8fafc"} !important;
             transform: none !important;
             box-shadow: none !important;
+        }}
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] label *,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label * {{
+            background: transparent !important;
+        }}
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] label > div:first-child,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label > div:first-child {{
+            margin: 0 !important;
+            transform: scale(0.8) !important;
         }}
         .st-key-profile_theme_radio_inline div[role="radiogroup"] label:has(input[type="radio"]:checked),
         [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label:has(input[type="radio"]:checked) {{
@@ -1253,30 +1282,22 @@ def show_user_info():
             transform: none !important;
             box-shadow: none !important;
             font-weight: 600 !important;
+            background: #3b82f6 !important;
+            border-color: #3b82f6 !important;
         }}
-        .st-key-profile_theme_radio_inline [data-testid="stRadio"] span,
-        .st-key-profile_theme_radio_inline [data-testid="stRadio"] p,
-        [class*="st-key-profile_theme_radio_inline"] [data-testid="stRadio"] span,
-        [class*="st-key-profile_theme_radio_inline"] [data-testid="stRadio"] p {{
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] span,
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] p,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] span,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] p {{
             color: {panel_text} !important;
             font-size: 0.88rem !important;
         }}
-        .st-key-profile_btn_change,
-        .st-key-profile_btn_delete,
-        .st-key-profile_btn_logout,
-        [class*="st-key-profile_btn_change"],
-        [class*="st-key-profile_btn_delete"],
-        [class*="st-key-profile_btn_logout"] {{
-            position: fixed !important;
-            right: 30px !important;
-            width: 268px !important;
-            z-index: 1395 !important;
-            margin: 0 !important;
-            padding: 0 !important;
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] label:has(input[type="radio"]:checked) span,
+        .st-key-profile_theme_radio_inline div[role="radiogroup"] label:has(input[type="radio"]:checked) p,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label:has(input[type="radio"]:checked) span,
+        [class*="st-key-profile_theme_radio_inline"] div[role="radiogroup"] label:has(input[type="radio"]:checked) p {{
+            color: #ffffff !important;
         }}
-        .st-key-profile_btn_change, [class*="st-key-profile_btn_change"] {{ bottom: 148px !important; }}
-        .st-key-profile_btn_delete, [class*="st-key-profile_btn_delete"] {{ bottom: 114px !important; }}
-        .st-key-profile_btn_logout, [class*="st-key-profile_btn_logout"] {{ bottom: 80px !important; }}
         .st-key-profile_btn_change button,
         .st-key-profile_btn_delete button,
         .st-key-profile_btn_logout button,
@@ -1284,8 +1305,8 @@ def show_user_info():
         [class*="st-key-profile_btn_delete"] button,
         [class*="st-key-profile_btn_logout"] button {{
             width: 100% !important;
-            min-height: 30px !important;
-            height: 30px !important;
+            min-height: 32px !important;
+            height: 32px !important;
             background: transparent !important;
             border: none !important;
             box-shadow: none !important;
@@ -1311,6 +1332,11 @@ def show_user_info():
         .st-key-profile_btn_logout button:hover p {{
             color: #38bdf8 !important;
         }}
+        .st-key-profile_menu_separator hr {{
+            border: none !important;
+            border-top: 1px solid {panel_border} !important;
+            margin: 0.2rem 0 0.35rem 0 !important;
+        }}
         .st-key-dialog_confirm_delete_user button,
         .st-key-dialog_cancel_delete_user button {{
             border-radius: 8px !important;
@@ -1328,62 +1354,72 @@ def show_user_info():
             background: {"#1e293b" if is_dark else "#ffffff"} !important;
             color: {panel_text} !important;
         }}
-        .st-key-profile_icon_toggle_btn {{
-            height: 0 !important;
-            min-height: 0 !important;
-            margin: 0 !important;
+        .st-key-profile_icon_toggle_btn button {{
+            position: fixed !important;
+            right: 18px !important;
+            bottom: 18px !important;
+            z-index: 1400 !important;
+            min-height: 46px !important;
+            height: 46px !important;
+            width: 46px !important;
+            border-radius: 999px !important;
+            border: 1px solid {panel_border} !important;
+            background: {"#0f172a" if is_dark else "#ffffff"} !important;
+            color: {panel_text} !important;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.26) !important;
             padding: 0 !important;
+            font-size: 20px !important;
+            line-height: 1 !important;
         }}
-        {layout_shift_css}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    if st.button("\U0001F464", key="profile_icon_toggle_btn"):
-        st.session_state.profile_menu_open = not st.session_state.get("profile_menu_open", False)
-        st.rerun()
-
-    if st.session_state.get("profile_menu_open", False):
-        st.markdown(
-            f"""
-            <div class="profile-floating-panel">
-              <div class="user-row">Username: {safe_user}</div>
-              <div class="theme-label">Theme</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        selected_theme = st.radio(
-            "Theme",
-            ["Light", "Dark"],
-            key=theme_widget_key,
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        selected_theme_norm = selected_theme.lower()
-        if selected_theme_norm != current_theme:
-            ok, _ = auth_mgr.set_user_theme(selected_theme_norm)
-            if not ok:
-                st.session_state.auth_feedback = {"level": "error", "text": "Unable to update theme."}
-            st.rerun()
-
-        if st.button("Change Password", key="profile_btn_change", type="tertiary"):
-            st.session_state.show_user_menu_change_password = True
-            st.session_state.show_user_menu_delete_confirm = False
-            st.session_state.profile_menu_open = False
-            st.rerun()
-
-        if st.button("Delete Profile", key="profile_btn_delete", type="tertiary"):
-            st.session_state.show_user_menu_delete_confirm = True
-            st.session_state.show_user_menu_change_password = False
-            st.session_state.profile_menu_open = False
-            st.rerun()
-
-        if st.button("Logout", key="profile_btn_logout", type="tertiary"):
-            st.session_state.profile_menu_open = False
-            auth_mgr.logout()
+    with st.container(key="profile_popover_anchor"):
+        if hasattr(st, "popover"):
+            with st.popover("\U0001F464"):
+                st.markdown(f"<div class='st-key-profile_user_label'>Username: {safe_user}</div>", unsafe_allow_html=True)
+                st.markdown("<div class='st-key-profile_theme_label'>Theme</div>", unsafe_allow_html=True)
+                st.radio(
+                    "Theme",
+                    ["Light", "Dark"],
+                    key=theme_widget_key,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+                st.markdown("<div class='st-key-profile_menu_separator'><hr></div>", unsafe_allow_html=True)
+                if st.button("Change Password", key="profile_btn_change", type="tertiary"):
+                    st.session_state.show_user_menu_change_password = True
+                    st.session_state.show_user_menu_delete_confirm = False
+                if st.button("Delete Profile", key="profile_btn_delete", type="tertiary"):
+                    st.session_state.show_user_menu_delete_confirm = True
+                    st.session_state.show_user_menu_change_password = False
+                if st.button("Logout", key="profile_btn_logout", type="tertiary"):
+                    auth_mgr.logout()
+        else:
+            # Fallback for older Streamlit versions without st.popover.
+            if st.button("\U0001F464", key="profile_icon_toggle_btn"):
+                st.session_state.profile_menu_open = not st.session_state.get("profile_menu_open", False)
+            if st.session_state.get("profile_menu_open", False):
+                st.radio(
+                    "Theme",
+                    ["Light", "Dark"],
+                    key=theme_widget_key,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+                if st.button("Change Password", key="profile_btn_change_fb", type="tertiary"):
+                    st.session_state.show_user_menu_change_password = True
+                    st.session_state.show_user_menu_delete_confirm = False
+                    st.session_state.profile_menu_open = False
+                if st.button("Delete Profile", key="profile_btn_delete_fb", type="tertiary"):
+                    st.session_state.show_user_menu_delete_confirm = True
+                    st.session_state.show_user_menu_change_password = False
+                    st.session_state.profile_menu_open = False
+                if st.button("Logout", key="profile_btn_logout_fb", type="tertiary"):
+                    st.session_state.profile_menu_open = False
+                    auth_mgr.logout()
 
     if st.session_state.get("show_user_menu_change_password", False):
         @st.dialog("Change Password")

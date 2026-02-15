@@ -7,6 +7,8 @@ import json
 import subprocess
 import threading
 import shutil
+import hashlib
+import difflib
 
 from openpyxl.utils import get_column_letter
 import requests
@@ -18,6 +20,37 @@ from auth import check_authentication, show_user_info, get_current_user_key
 if not check_authentication():
     st.stop()
 show_user_info()
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant, Provided the similarity score by comparing text 1 and"
+    " text 2, just provide only similarity score without explaination"
+)
+DEFAULT_USER_PROMPT_TEMPLATE = (
+    "Compare the following two texts and provide a similarity score as a percentage."
+    " Text 1: {answer1} Text 2: {answer2}"
+)
+
+
+def _normalized_prompt_value(prompt_value, fallback):
+    """Return fallback when prompt is missing/blank, otherwise keep user-entered content."""
+    if isinstance(prompt_value, str) and prompt_value.strip():
+        return prompt_value
+    return fallback
+
+
+def _lexical_similarity_percent(text1, text2):
+    """Deterministic lexical similarity fallback (0-100)."""
+    a = str(text1 or "").strip().lower()
+    b = str(text2 or "").strip().lower()
+    if not a or not b:
+        return 0.0
+    seq_ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    union = a_tokens | b_tokens
+    jaccard = (len(a_tokens & b_tokens) / len(union)) if union else 0.0
+    score = (0.72 * seq_ratio) + (0.28 * jaccard)
+    return round(max(0.0, min(1.0, score)) * 100.0, 2)
 
 
 def read_uploaded_file(uploaded_file, sheet_name=None):
@@ -568,16 +601,14 @@ st.markdown("""
 # This prevents Streamlit errors when code attempts to set session_state
 # after a widget with the same key has already been created.
 def _ensure_ai_defaults():
-    default_system = (
-        "You are a helpful assistant, Provided the similarity score by comparing text 1 and"
-        " text 2, just provide only similarity score without explaination"
+    st.session_state['gpt_system_prompt'] = _normalized_prompt_value(
+        st.session_state.get('gpt_system_prompt'),
+        DEFAULT_SYSTEM_PROMPT,
     )
-    default_user_tpl = (
-        "Compare the following two texts and provide a similarity score as a percentage."
-        " Text 1: {answer1} Text 2: {answer2}"
+    st.session_state['gpt_user_template'] = _normalized_prompt_value(
+        st.session_state.get('gpt_user_template'),
+        DEFAULT_USER_PROMPT_TEMPLATE,
     )
-    st.session_state.setdefault('gpt_system_prompt', default_system)
-    st.session_state.setdefault('gpt_user_template', default_user_tpl)
     st.session_state.setdefault('gpt_temperature', 0.0)
     st.session_state.setdefault('gpt_top_p', 1.0)
     st.session_state.setdefault('gpt_max_tokens', 20)
@@ -598,15 +629,8 @@ def _ensure_ai_defaults():
 _ensure_ai_defaults()
 
 # --- Advanced AI provider settings persistence (moved early) ---
-default_system = (
-    "You are a helpful assistant, Provided the similarity score by comparing text 1 and"
-    " text 2, just provide only similarity score without explaination"
-)
-
-default_user_tpl = (
-    "Compare the following two texts and provide a similarity score as a percentage."
-    " Text 1: {answer1} Text 2: {answer2}"
-)
+default_system = DEFAULT_SYSTEM_PROMPT
+default_user_tpl = DEFAULT_USER_PROMPT_TEMPLATE
 
 # Use working directory for persistent file (Streamlit may run from a temp copy)
 SETTINGS_PATH = os.path.join(os.getcwd(), '.gpt_settings.json')
@@ -691,8 +715,14 @@ def save_gpt_settings(data):
                 pass
 
         new_struct['current'] = {
-            'gpt_system_prompt': data.get('gpt_system_prompt'),
-            'gpt_user_template': data.get('gpt_user_template'),
+            'gpt_system_prompt': _normalized_prompt_value(
+                data.get('gpt_system_prompt'),
+                DEFAULT_SYSTEM_PROMPT,
+            ),
+            'gpt_user_template': _normalized_prompt_value(
+                data.get('gpt_user_template'),
+                DEFAULT_USER_PROMPT_TEMPLATE,
+            ),
             'gpt_temperature': data.get('gpt_temperature'),
             'gpt_top_p': data.get('gpt_top_p'),
             'gpt_max_tokens': data.get('gpt_max_tokens'),
@@ -716,8 +746,14 @@ try:
     if saved:
         current = saved.get('current') if isinstance(saved.get('current'), dict) else saved
         # assign (do not use setdefault) so saved values override the early defaults
-        st.session_state['gpt_system_prompt'] = current.get('gpt_system_prompt', default_system)
-        st.session_state['gpt_user_template'] = current.get('gpt_user_template', default_user_tpl)
+        st.session_state['gpt_system_prompt'] = _normalized_prompt_value(
+            current.get('gpt_system_prompt'),
+            default_system,
+        )
+        st.session_state['gpt_user_template'] = _normalized_prompt_value(
+            current.get('gpt_user_template'),
+            default_user_tpl,
+        )
         st.session_state['gpt_temperature'] = current.get('gpt_temperature', 0.0)
         st.session_state['gpt_top_p'] = current.get('gpt_top_p', 1.0)
         st.session_state['gpt_max_tokens'] = current.get('gpt_max_tokens', 20)
@@ -765,6 +801,8 @@ if st.session_state.pop('_advanced_reset_pending', False):
             st.session_state[_resolved_model_key] = _default_model
             st.session_state['active_provider_model_name'] = _default_model
         st.session_state[_custom_model_key] = ""
+        st.session_state['gpt_system_prompt'] = DEFAULT_SYSTEM_PROMPT
+        st.session_state['gpt_user_template'] = DEFAULT_USER_PROMPT_TEMPLATE
 
         # Remove only selected model API key from persisted settings for current user.
         _saved = load_gpt_settings() or {}
@@ -773,6 +811,14 @@ if st.session_state.pop('_advanced_reset_pending', False):
             del _saved['api_keys'][reset_model]
         if 'api_keys' in _saved and not _saved.get('api_keys'):
             del _saved['api_keys']
+        _saved_current = _saved.get('current')
+        if not isinstance(_saved_current, dict):
+            _saved_current = {}
+            _saved['current'] = _saved_current
+        _saved_current['gpt_system_prompt'] = DEFAULT_SYSTEM_PROMPT
+        _saved_current['gpt_user_template'] = DEFAULT_USER_PROMPT_TEMPLATE
+        if reset_model:
+            _saved_current['matching_method'] = reset_model
         _persist_user_settings(_saved)
     except Exception as e:
         reset_ok = False
@@ -918,7 +964,7 @@ provider_aliases = {
     "Gemini": "Google Gemini",
     "Grok": "xAI Grok",
     "Claude 3 Opus": "Anthropic Claude",
-    "OpenAI GPT-4o-mini": "OpenAI GPT-4o",
+    "OpenAI GPT-4o-mini": "OpenAI GPT-4o-mini",
     "__local_disabled__": "Local Model",
 }
 
@@ -1395,8 +1441,14 @@ if st.session_state.get('show_advanced_gpt', False):
                         current_model = st.session_state.get('matching_method', matching_method)
                         model_key = f"api_key_{current_model.replace(' ', '_')}" if current_model else "api_key_default"
                         payload = {
-                            'gpt_system_prompt': st.session_state.get('gpt_system_prompt', default_system),
-                            'gpt_user_template': st.session_state.get('gpt_user_template', default_user_tpl),
+                            'gpt_system_prompt': _normalized_prompt_value(
+                                st.session_state.get('gpt_system_prompt'),
+                                default_system,
+                            ),
+                            'gpt_user_template': _normalized_prompt_value(
+                                st.session_state.get('gpt_user_template'),
+                                default_user_tpl,
+                            ),
                             'gpt_temperature': st.session_state.get('gpt_temperature', 0.0),
                             'gpt_top_p': st.session_state.get('gpt_top_p', 1.0),
                             'gpt_max_tokens': st.session_state.get('gpt_max_tokens', 20),
@@ -1419,8 +1471,14 @@ if st.session_state.get('show_advanced_gpt', False):
         matching_method = st.session_state.get('matching_method')
         model_key = f'api_key_{matching_method.replace(" ", "_")}' if matching_method else 'api_key_default'
         data = {
-            'gpt_system_prompt': st.session_state.get('gpt_system_prompt'),
-            'gpt_user_template': st.session_state.get('gpt_user_template'),
+            'gpt_system_prompt': _normalized_prompt_value(
+                st.session_state.get('gpt_system_prompt'),
+                default_system,
+            ),
+            'gpt_user_template': _normalized_prompt_value(
+                st.session_state.get('gpt_user_template'),
+                default_user_tpl,
+            ),
             'gpt_temperature': st.session_state.get('gpt_temperature', 0.0),
             'gpt_top_p': st.session_state.get('gpt_top_p', 1.0),
             'gpt_max_tokens': st.session_state.get('gpt_max_tokens', 20),
@@ -1440,8 +1498,8 @@ if st.session_state.get('show_advanced_gpt', False):
         ok = reset_gpt_settings()
         # Update session state defaults in a way that's safe for callbacks
         st.session_state.update({
-            'gpt_system_prompt': default_system,
-            'gpt_user_template': default_user_tpl,
+            'gpt_system_prompt': DEFAULT_SYSTEM_PROMPT,
+            'gpt_user_template': DEFAULT_USER_PROMPT_TEMPLATE,
             'gpt_temperature': 0.0,
             'gpt_top_p': 1.0,
             'gpt_max_tokens': 20,
@@ -1848,17 +1906,76 @@ if uploaded_file1:
             st.error(f"Error reading uploaded file(s): {error_msg}")
 
 # --- Model Loading (with error handling) ---
+class _NumpyTensorWrapper:
+    """Tiny tensor-like wrapper supporting .diagonal().cpu().numpy() chain."""
+
+    def __init__(self, arr):
+        self._arr = np.asarray(arr, dtype=float)
+
+    def diagonal(self):
+        return _NumpyTensorWrapper(np.diagonal(self._arr))
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._arr
+
+
+class _FallbackUtil:
+    """Minimal cosine-sim helper compatible with existing local-model call sites."""
+
+    @staticmethod
+    def cos_sim(a, b):
+        a_arr = np.asarray(a, dtype=float)
+        b_arr = np.asarray(b, dtype=float)
+        if a_arr.ndim == 1:
+            a_arr = a_arr.reshape(1, -1)
+        if b_arr.ndim == 1:
+            b_arr = b_arr.reshape(1, -1)
+
+        a_norm = np.linalg.norm(a_arr, axis=1, keepdims=True)
+        b_norm = np.linalg.norm(b_arr, axis=1, keepdims=True)
+        a_norm[a_norm == 0] = 1.0
+        b_norm[b_norm == 0] = 1.0
+        sim_matrix = (a_arr / a_norm) @ (b_arr / b_norm).T
+        return _NumpyTensorWrapper(sim_matrix)
+
+
+class _FallbackSentenceModel:
+    """Lightweight local embedding fallback when sentence-transformers is unavailable."""
+
+    def __init__(self, dim=384):
+        self.dim = dim
+
+    def _embed_text(self, text):
+        vec = np.zeros(self.dim, dtype=float)
+        tokens = str(text).lower().split()
+        for token in tokens:
+            idx = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16) % self.dim
+            vec[idx] += 1.0
+        return vec
+
+    def encode(self, texts, convert_to_tensor=True):
+        if isinstance(texts, str):
+            texts = [texts]
+        texts = texts or []
+        if not texts:
+            return np.zeros((0, self.dim), dtype=float)
+        return np.vstack([self._embed_text(t) for t in texts])
+
+
 @st.cache_resource
 def load_main_model(selected_model):
     # Import inside the function so the app can still run parts of the UI
-    # when sentence-transformers is not installed. If missing, raise a
-    # clear error for the user to install the dependency.
+    # when sentence-transformers is not installed.
     try:
         import importlib
         st_mod = importlib.import_module('sentence_transformers')
         SentenceTransformer = getattr(st_mod, 'SentenceTransformer')
-    except Exception as e:
-        raise ImportError("The 'sentence_transformers' package is required for Local Model mode. Please install it (pip install -r requirements.txt or pip install sentence-transformers) and restart the app.") from e
+    except Exception:
+        # Fallback mode: keep Local Model usable without hard dependency failure.
+        return _FallbackSentenceModel()
     return SentenceTransformer(selected_model)
 
 
@@ -1887,22 +2004,33 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
     from ai_providers import get_provider
 
     # Pass a template string; providers perform the final format(answer1, answer2).
-    if user_template:
-        prompt_template = str(user_template)
-    else:
-        prompt_template = "Compare the following two texts and provide a similarity score as a percentage. Text 1: {answer1} Text 2: {answer2}"
-
-    sys_content = system_prompt or "You are a helpful assistant. Provide the similarity score by comparing text 1 and text 2. Respond with only the similarity score as a plain number (no explanation)."
+    prompt_template = _normalized_prompt_value(user_template, DEFAULT_USER_PROMPT_TEMPLATE)
+    sys_content = _normalized_prompt_value(system_prompt, DEFAULT_SYSTEM_PROMPT)
+    fallback_score = _lexical_similarity_percent(answer1, answer2)
+    safe_max_tokens = max(16, int(max_tokens or 20))
 
     try:
         provider = get_provider(provider_name, api_key)
         score, explanation = provider.get_similarity(
             answer1, answer2, sys_content, prompt_template,
-            temperature, top_p, max_tokens, model_name=model_name
+            temperature, top_p, safe_max_tokens, model_name=model_name
         )
-        return score if score is not None else 0, ""
+        if score is None:
+            return fallback_score, (explanation or "Provider returned no score. Using lexical fallback.")
+        try:
+            score_val = float(score)
+        except Exception:
+            return fallback_score, "Provider returned non-numeric score. Using lexical fallback."
+        if 0.0 <= score_val <= 1.0 and score_val not in (0.0, 1.0):
+            score_val = round(score_val * 100.0, 2)
+        score_val = max(0.0, min(100.0, score_val))
+        if score_val == 0.0 and isinstance(explanation, str):
+            low_exp = explanation.lower()
+            if any(tok in low_exp for tok in ["error", "failed", "timeout", "invalid", "unauthorized", "forbidden"]):
+                return fallback_score, explanation
+        return score_val, (explanation or "")
     except Exception as e:
-        return None, f"Provider error: {e}"
+        return fallback_score, f"Provider error: {e}"
 
 
 # Legacy function for backward compatibility
@@ -1961,9 +2089,14 @@ if compare_clicked:
         st_mod = importlib.import_module('sentence_transformers')
         SentenceTransformer = getattr(st_mod, 'SentenceTransformer', None)
         util = getattr(st_mod, 'util', None)
+        if util is None:
+            util = _FallbackUtil()
     except Exception:
         SentenceTransformer = None
-        util = None
+        util = _FallbackUtil()
+        if not st.session_state.get("_local_fallback_notice_shown", False):
+            st.info("Local Model is running in lightweight fallback mode because 'sentence-transformers' is not installed.")
+            st.session_state["_local_fallback_notice_shown"] = True
     try:
         CrossEncoder = None
         ce_mod = importlib.import_module('sentence_transformers.cross_encoder')
@@ -2105,57 +2238,71 @@ if compare_clicked:
                                 st.info("Comparison cancelled before model loading.")
                                 raise Exception("Cancelled")
                             main_model = load_main_model(selected_model)
-                            cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
-                            # Chunked encoding like other local paths
                             n = min_len
                             chunk_size = 64
                             progress = st.progress(0, text="Encoding and computing local similarities...")
-                            sims = []
-                            raw_sims = []
-                            processed = 0
-                            for i in range(0, n, chunk_size):
-                                if st.session_state.get("cancel_requested", False):
-                                    st.info("Comparison cancelled by user.")
-                                    break
-                                end = min(i + chunk_size, n)
-                                emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
-                                emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
-                                sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
-                                sims.extend(sim_chunk.tolist())
-                                raw_sims.extend(sim_chunk.round(4).tolist())
-                                processed = end
-                                progress.progress(processed / n, text=f"Encoded and compared {processed}/{n} pairs")
-                            progress.progress(1.0, text=f"Encoded and compared {n}/{n} pairs")
-                            progress.empty()
-                            similarities = np.array(sims)
-                            percent_sim_mpnet = (similarities * 100).round(2)
-                            raw_sim_mpnet = np.array(raw_sims)
-                            cross_scores = None
-                            if cross_encoder is not None:
-                                try:
-                                    pairs = list(zip(cleaned1, cleaned2))
-                                    cross_sim_list = []
-                                    for i in range(0, n, chunk_size):
-                                        if st.session_state.get("cancel_requested", False):
-                                            st.info("Comparison cancelled by user during cross-encoder step.")
-                                            break
-                                        end = min(i + chunk_size, n)
-                                        pred = cross_encoder.predict(pairs[i:end], show_progress_bar=False)
-                                        cross_sim_list.extend(pred.tolist())
-                                        progress.progress(80 + int(end / n * 20), text=f"Cross-encoder processed {end}/{n} pairs")
-                                    cross_sim = np.array(cross_sim_list)
-                                    if cross_sim.size and np.max(cross_sim) - np.min(cross_sim) > 0:
-                                        cross_sim = (cross_sim - np.min(cross_sim)) / (np.max(cross_sim) - np.min(cross_sim))
-                                    cross_scores = (cross_sim * 100).round(2) if cross_sim.size else percent_sim_mpnet
-                                except Exception as e:
-                                    st.warning(f"Cross-encoder failed: {e}")
-                                    cross_scores = percent_sim_mpnet
-                            else:
+                            if isinstance(main_model, _FallbackSentenceModel):
+                                percent_sim_mpnet = []
+                                raw_sims = []
+                                for idx, (lhs, rhs) in enumerate(zip(cleaned1, cleaned2)):
+                                    if st.session_state.get("cancel_requested", False):
+                                        st.info("Comparison cancelled by user.")
+                                        break
+                                    s = _lexical_similarity_percent(lhs, rhs)
+                                    percent_sim_mpnet.append(s)
+                                    raw_sims.append(round(s / 100.0, 4))
+                                    progress.progress((idx + 1) / max(1, n), text=f"Compared {idx+1}/{n} pairs")
+                                raw_sim_mpnet = np.array(raw_sims)
                                 cross_scores = percent_sim_mpnet
-                                try:
-                                    progress.progress(100, text="Local model comparison complete")
-                                except Exception:
-                                    pass
+                                progress.empty()
+                            else:
+                                cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
+                                sims = []
+                                raw_sims = []
+                                processed = 0
+                                for i in range(0, n, chunk_size):
+                                    if st.session_state.get("cancel_requested", False):
+                                        st.info("Comparison cancelled by user.")
+                                        break
+                                    end = min(i + chunk_size, n)
+                                    emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
+                                    emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
+                                    sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
+                                    sims.extend(sim_chunk.tolist())
+                                    raw_sims.extend(sim_chunk.round(4).tolist())
+                                    processed = end
+                                    progress.progress(processed / n, text=f"Encoded and compared {processed}/{n} pairs")
+                                progress.progress(1.0, text=f"Encoded and compared {n}/{n} pairs")
+                                progress.empty()
+                                similarities = np.array(sims)
+                                percent_sim_mpnet = (similarities * 100).round(2)
+                                raw_sim_mpnet = np.array(raw_sims)
+                                cross_scores = None
+                                if cross_encoder is not None:
+                                    try:
+                                        pairs = list(zip(cleaned1, cleaned2))
+                                        cross_sim_list = []
+                                        for i in range(0, n, chunk_size):
+                                            if st.session_state.get("cancel_requested", False):
+                                                st.info("Comparison cancelled by user during cross-encoder step.")
+                                                break
+                                            end = min(i + chunk_size, n)
+                                            pred = cross_encoder.predict(pairs[i:end], show_progress_bar=False)
+                                            cross_sim_list.extend(pred.tolist())
+                                            progress.progress(80 + int(end / n * 20), text=f"Cross-encoder processed {end}/{n} pairs")
+                                        cross_sim = np.array(cross_sim_list)
+                                        if cross_sim.size and np.max(cross_sim) - np.min(cross_sim) > 0:
+                                            cross_sim = (cross_sim - np.min(cross_sim)) / (np.max(cross_sim) - np.min(cross_sim))
+                                        cross_scores = (cross_sim * 100).round(2) if cross_sim.size else percent_sim_mpnet
+                                    except Exception as e:
+                                        st.warning(f"Cross-encoder failed: {e}")
+                                        cross_scores = percent_sim_mpnet
+                                else:
+                                    cross_scores = percent_sim_mpnet
+                                    try:
+                                        progress.progress(100, text="Local model comparison complete")
+                                    except Exception:
+                                        pass
 
                             from difflib import SequenceMatcher
                             def fuzzy_ratio(a, b):
@@ -2367,90 +2514,102 @@ if compare_clicked:
                                     st.info("Comparison cancelled before model loading.")
                                     raise Exception("Cancelled")
                                 main_model = load_main_model(selected_model)
-                                cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
-                                # Chunked encoding and similarity computation so we can show progress and support cancellation
-                                try:
-                                    import importlib
-                                    torch = importlib.import_module('torch')
-                                except Exception:
-                                    torch = None
                                 n = min_len
                                 chunk_size = 64
                                 progress = st.progress(0, text="Encoding and computing local similarities...")
-                                sim_a_list = []
-                                sim_b_list = []
-                                raw_a_list = []
-                                raw_b_list = []
-                                processed = 0
-                                for i in range(0, n, chunk_size):
-                                    if st.session_state.get("cancel_requested", False):
-                                        st.info("Comparison cancelled by user.")
-                                        break
-                                    end = min(i + chunk_size, n)
-                                    # Encode chunk
-                                    emb_b_chunk = main_model.encode(cleaned_base[i:end], convert_to_tensor=True)
-                                    emb_a_chunk = main_model.encode(cleaned_a[i:end], convert_to_tensor=True)
-                                    emb_c_chunk = main_model.encode(cleaned_b[i:end], convert_to_tensor=True)
-                                    # Compute cosine similarities per chunk
-                                    sim_a_chunk = util.cos_sim(emb_b_chunk, emb_a_chunk).diagonal().cpu().numpy()
-                                    sim_b_chunk = util.cos_sim(emb_b_chunk, emb_c_chunk).diagonal().cpu().numpy()
-                                    sim_a_list.extend(sim_a_chunk.tolist())
-                                    sim_b_list.extend(sim_b_chunk.tolist())
-                                    raw_a_list.extend(sim_a_chunk.round(4).tolist())
-                                    raw_b_list.extend(sim_b_chunk.round(4).tolist())
-                                    processed = end
-                                    progress.progress(int(processed / n * 60), text=f"Encoded and compared {processed}/{n} pairs")
 
-                                # Aggregate results
-                                sim_a = np.array(sim_a_list)
-                                sim_b = np.array(sim_b_list)
-                                percent_a = (sim_a * 100).round(2)
-                                percent_b = (sim_b * 100).round(2)
-                                raw_a = np.array(raw_a_list)
-                                raw_b = np.array(raw_b_list)
-                                cross_scores_a = None
-                                cross_scores_b = None
-                                # If cross-encoder available, run chunked predictions to update progress
-                                if cross_encoder is not None:
-                                    try:
-                                        pairs_a = list(zip(cleaned_base, cleaned_a))
-                                        pairs_b = list(zip(cleaned_base, cleaned_b))
-                                        cross_scores_a_list = []
-                                        cross_scores_b_list = []
-                                        for i in range(0, n, chunk_size):
-                                            if st.session_state.get("cancel_requested", False):
-                                                st.info("Comparison cancelled by user during cross-encoder step.")
-                                                break
-                                            end = min(i + chunk_size, n)
-                                            chunk_pairs_a = pairs_a[i:end]
-                                            chunk_pairs_b = pairs_b[i:end]
-                                            pred_a = cross_encoder.predict(chunk_pairs_a, show_progress_bar=False)
-                                            pred_b = cross_encoder.predict(chunk_pairs_b, show_progress_bar=False)
-                                            cross_scores_a_list.extend(pred_a.tolist())
-                                            cross_scores_b_list.extend(pred_b.tolist())
-                                            progress.progress(60 + int(end / n * 30), text=f"Cross-encoder processed {end}/{n} pairs")
-
-                                        def normalize(arr):
-                                            arr = np.array(arr)
-                                            if np.max(arr) - np.min(arr) > 0:
-                                                arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
-                                            return (arr * 100).round(2)
-
-                                        cross_scores_a = normalize(cross_scores_a_list) if cross_scores_a_list else percent_a
-                                        cross_scores_b = normalize(cross_scores_b_list) if cross_scores_b_list else percent_b
-                                        progress.progress(100, text="Local model comparison complete")
-                                    except Exception as e:
-                                        st.warning(f"Cross-encoder failed: {e}")
-                                        cross_scores_a = percent_a
-                                        cross_scores_b = percent_b
-                                else:
+                                if isinstance(main_model, _FallbackSentenceModel):
+                                    percent_a = []
+                                    percent_b = []
+                                    raw_a_vals = []
+                                    raw_b_vals = []
+                                    for idx, (base_t, a_t, b_t) in enumerate(zip(cleaned_base, cleaned_a, cleaned_b)):
+                                        if st.session_state.get("cancel_requested", False):
+                                            st.info("Comparison cancelled by user.")
+                                            break
+                                        sa = _lexical_similarity_percent(base_t, a_t)
+                                        sb = _lexical_similarity_percent(base_t, b_t)
+                                        percent_a.append(sa)
+                                        percent_b.append(sb)
+                                        raw_a_vals.append(round(sa / 100.0, 4))
+                                        raw_b_vals.append(round(sb / 100.0, 4))
+                                        progress.progress((idx + 1) / max(1, n), text=f"Compared {idx+1}/{n} pairs")
+                                    raw_a = np.array(raw_a_vals)
+                                    raw_b = np.array(raw_b_vals)
                                     cross_scores_a = percent_a
                                     cross_scores_b = percent_b
-                                    # Ensure the progress bar completes when cross-encoder isn't used
-                                    try:
-                                        progress.progress(100, text="Local model comparison complete")
-                                    except Exception:
-                                        pass
+                                    progress.empty()
+                                else:
+                                    cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
+                                    sim_a_list = []
+                                    sim_b_list = []
+                                    raw_a_list = []
+                                    raw_b_list = []
+                                    processed = 0
+                                    for i in range(0, n, chunk_size):
+                                        if st.session_state.get("cancel_requested", False):
+                                            st.info("Comparison cancelled by user.")
+                                            break
+                                        end = min(i + chunk_size, n)
+                                        emb_b_chunk = main_model.encode(cleaned_base[i:end], convert_to_tensor=True)
+                                        emb_a_chunk = main_model.encode(cleaned_a[i:end], convert_to_tensor=True)
+                                        emb_c_chunk = main_model.encode(cleaned_b[i:end], convert_to_tensor=True)
+                                        sim_a_chunk = util.cos_sim(emb_b_chunk, emb_a_chunk).diagonal().cpu().numpy()
+                                        sim_b_chunk = util.cos_sim(emb_b_chunk, emb_c_chunk).diagonal().cpu().numpy()
+                                        sim_a_list.extend(sim_a_chunk.tolist())
+                                        sim_b_list.extend(sim_b_chunk.tolist())
+                                        raw_a_list.extend(sim_a_chunk.round(4).tolist())
+                                        raw_b_list.extend(sim_b_chunk.round(4).tolist())
+                                        processed = end
+                                        progress.progress(int(processed / n * 60), text=f"Encoded and compared {processed}/{n} pairs")
+
+                                    sim_a = np.array(sim_a_list)
+                                    sim_b = np.array(sim_b_list)
+                                    percent_a = (sim_a * 100).round(2)
+                                    percent_b = (sim_b * 100).round(2)
+                                    raw_a = np.array(raw_a_list)
+                                    raw_b = np.array(raw_b_list)
+                                    cross_scores_a = None
+                                    cross_scores_b = None
+                                    if cross_encoder is not None:
+                                        try:
+                                            pairs_a = list(zip(cleaned_base, cleaned_a))
+                                            pairs_b = list(zip(cleaned_base, cleaned_b))
+                                            cross_scores_a_list = []
+                                            cross_scores_b_list = []
+                                            for i in range(0, n, chunk_size):
+                                                if st.session_state.get("cancel_requested", False):
+                                                    st.info("Comparison cancelled by user during cross-encoder step.")
+                                                    break
+                                                end = min(i + chunk_size, n)
+                                                chunk_pairs_a = pairs_a[i:end]
+                                                chunk_pairs_b = pairs_b[i:end]
+                                                pred_a = cross_encoder.predict(chunk_pairs_a, show_progress_bar=False)
+                                                pred_b = cross_encoder.predict(chunk_pairs_b, show_progress_bar=False)
+                                                cross_scores_a_list.extend(pred_a.tolist())
+                                                cross_scores_b_list.extend(pred_b.tolist())
+                                                progress.progress(60 + int(end / n * 30), text=f"Cross-encoder processed {end}/{n} pairs")
+
+                                            def normalize(arr):
+                                                arr = np.array(arr)
+                                                if np.max(arr) - np.min(arr) > 0:
+                                                    arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
+                                                return (arr * 100).round(2)
+
+                                            cross_scores_a = normalize(cross_scores_a_list) if cross_scores_a_list else percent_a
+                                            cross_scores_b = normalize(cross_scores_b_list) if cross_scores_b_list else percent_b
+                                            progress.progress(100, text="Local model comparison complete")
+                                        except Exception as e:
+                                            st.warning(f"Cross-encoder failed: {e}")
+                                            cross_scores_a = percent_a
+                                            cross_scores_b = percent_b
+                                    else:
+                                        cross_scores_a = percent_a
+                                        cross_scores_b = percent_b
+                                        try:
+                                            progress.progress(100, text="Local model comparison complete")
+                                        except Exception:
+                                            pass
                                 from difflib import SequenceMatcher
                                 def fuzzy_ratio(a, b):
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
@@ -2636,64 +2795,79 @@ if compare_clicked:
                                     st.info("Comparison cancelled before model loading.")
                                     raise Exception("Cancelled")
                                 main_model = load_main_model(selected_model)
-                                cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
                                 n = min_len
                                 chunk_size = 64
                                 progress = st.progress(0, text="Encoding and computing local similarities...")
-                                sims = []
-                                raw_sims = []
-                                processed = 0
-                                for i in range(0, n, chunk_size):
-                                    if st.session_state.get("cancel_requested", False):
-                                        st.info("Comparison cancelled by user.")
-                                        break
-                                    end = min(i + chunk_size, n)
-                                    emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
-                                    emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
-                                    sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
-                                    sims.extend(sim_chunk.tolist())
-                                    raw_sims.extend(sim_chunk.round(4).tolist())
-                                    processed = end
-                                    progress.progress(processed / n, text=f"Encoded and compared {processed}/{n} pairs")
 
-                                progress.progress(1.0, text=f"Encoded and compared {n}/{n} pairs")
-                                progress.empty()
-
-                                similarities = np.array(sims)
-                                percent_sim_mpnet = (similarities * 100).round(2)
-                                raw_sim_mpnet = np.array(raw_sims)
-                                cross_scores = None
-                                if cross_encoder is not None:
-                                    try:
-                                        pairs = list(zip(cleaned1, cleaned2))
-                                        cross_sim_list = []
-                                        for i in range(0, n, chunk_size):
-                                            if st.session_state.get("cancel_requested", False):
-                                                st.info("Comparison cancelled by user during cross-encoder step.")
-                                                break
-                                            end = min(i + chunk_size, n)
-                                            pred = cross_encoder.predict(pairs[i:end], show_progress_bar=False)
-                                            cross_sim_list.extend(pred.tolist())
-                                            progress.progress(80 + int(end / n * 20), text=f"Cross-encoder processed {end}/{n} pairs")
-                                        cross_sim = np.array(cross_sim_list)
-                                        if cross_sim.size and np.max(cross_sim) - np.min(cross_sim) > 0:
-                                            cross_sim = (cross_sim - np.min(cross_sim)) / (np.max(cross_sim) - np.min(cross_sim))
-                                        cross_scores = (cross_sim * 100).round(2) if cross_sim.size else percent_sim_mpnet
-                                    except Exception as e:
-                                        st.warning(f"Cross-encoder failed: {e}")
-                                        cross_scores = percent_sim_mpnet
-                                else:
+                                if isinstance(main_model, _FallbackSentenceModel):
+                                    percent_sim_mpnet = []
+                                    raw_sims = []
+                                    for idx, (lhs, rhs) in enumerate(zip(cleaned1, cleaned2)):
+                                        if st.session_state.get("cancel_requested", False):
+                                            st.info("Comparison cancelled by user.")
+                                            break
+                                        s = _lexical_similarity_percent(lhs, rhs)
+                                        percent_sim_mpnet.append(s)
+                                        raw_sims.append(round(s / 100.0, 4))
+                                        progress.progress((idx + 1) / max(1, n), text=f"Compared {idx+1}/{n} pairs")
+                                    raw_sim_mpnet = np.array(raw_sims)
                                     cross_scores = percent_sim_mpnet
-                                    # Ensure the progress bar completes when cross-encoder isn't used
-                                    try:
-                                        progress.progress(100, text="Local model comparison complete")
-                                    except Exception:
-                                        pass
+                                    progress.empty()
+                                else:
+                                    cross_encoder = load_cross_encoder_model(selected_model) if selected_model in CROSS_ENCODER_MODELS else None
+                                    sims = []
+                                    raw_sims = []
+                                    processed = 0
+                                    for i in range(0, n, chunk_size):
+                                        if st.session_state.get("cancel_requested", False):
+                                            st.info("Comparison cancelled by user.")
+                                            break
+                                        end = min(i + chunk_size, n)
+                                        emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
+                                        emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
+                                        sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
+                                        sims.extend(sim_chunk.tolist())
+                                        raw_sims.extend(sim_chunk.round(4).tolist())
+                                        processed = end
+                                        progress.progress(processed / n, text=f"Encoded and compared {processed}/{n} pairs")
+
+                                    progress.progress(1.0, text=f"Encoded and compared {n}/{n} pairs")
+                                    progress.empty()
+
+                                    similarities = np.array(sims)
+                                    percent_sim_mpnet = (similarities * 100).round(2)
+                                    raw_sim_mpnet = np.array(raw_sims)
+                                    cross_scores = None
+                                    if cross_encoder is not None:
+                                        try:
+                                            pairs = list(zip(cleaned1, cleaned2))
+                                            cross_sim_list = []
+                                            for i in range(0, n, chunk_size):
+                                                if st.session_state.get("cancel_requested", False):
+                                                    st.info("Comparison cancelled by user during cross-encoder step.")
+                                                    break
+                                                end = min(i + chunk_size, n)
+                                                pred = cross_encoder.predict(pairs[i:end], show_progress_bar=False)
+                                                cross_sim_list.extend(pred.tolist())
+                                                progress.progress(80 + int(end / n * 20), text=f"Cross-encoder processed {end}/{n} pairs")
+                                            cross_sim = np.array(cross_sim_list)
+                                            if cross_sim.size and np.max(cross_sim) - np.min(cross_sim) > 0:
+                                                cross_sim = (cross_sim - np.min(cross_sim)) / (np.max(cross_sim) - np.min(cross_sim))
+                                            cross_scores = (cross_sim * 100).round(2) if cross_sim.size else percent_sim_mpnet
+                                        except Exception as e:
+                                            st.warning(f"Cross-encoder failed: {e}")
+                                            cross_scores = percent_sim_mpnet
+                                    else:
+                                        cross_scores = percent_sim_mpnet
+                                        try:
+                                            progress.progress(100, text="Local model comparison complete")
+                                        except Exception:
+                                            pass
                                 from difflib import SequenceMatcher
                                 def fuzzy_ratio(a, b):
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
                                 fuzzy_scores = [fuzzy_ratio(a, b) for a, b in zip(cleaned1, cleaned2)]
-                                if cross_encoder is not None and cross_scores is not None:
+                                if not isinstance(main_model, _FallbackSentenceModel) and cross_encoder is not None and cross_scores is not None:
                                     final_percent_sim = cross_scores
                                 else:
                                     final_percent_sim = [max(mpnet, fuzz) for mpnet, fuzz in zip(percent_sim_mpnet, fuzzy_scores)]

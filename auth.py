@@ -610,6 +610,18 @@ class AuthManager:
             .info-box { color: #cbd5e1 !important; border-color: #334155 !important; background: #0f172a !important; }
             .stSelectbox > div > div { background: #0f172a !important; border: 1px solid #334155 !important; }
             .stSelectbox > div > div * { color: #e5e7eb !important; fill: #e5e7eb !important; }
+            [data-testid="stWidgetLabelHelp"] button {
+                color: #cbd5e1 !important;
+                background: transparent !important;
+                border: 1px solid #475569 !important;
+                border-radius: 999px !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button svg,
+            [data-testid="stWidgetLabelHelp"] svg {
+                color: #cbd5e1 !important;
+                fill: #cbd5e1 !important;
+                stroke: #cbd5e1 !important;
+            }
             [data-testid="stFileUploaderDropzone"], [data-testid="stFileUploaderDropzone"] * { background: #0f172a !important; color: #e5e7eb !important; border-color: #334155 !important; }
             .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stNumberInput input { background: #0f172a !important; color: #e5e7eb !important; border-color: #334155 !important; }
             .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #94a3b8 !important; opacity: 1 !important; }
@@ -624,6 +636,86 @@ class AuthManager:
             .stButton button[kind="primary"], .stButton button[kind="secondary"], .stFormSubmitButton button { background: #1e293b !important; color: #e5e7eb !important; border: 1px solid #475569 !important; }
             a { color: #7dd3fc !important; }
             [data-testid="stCaptionContainer"] p, small { color: #cbd5e1 !important; }
+            /* Help icon visibility + tooltip readability (dark theme) */
+            [data-testid="stWidgetLabelHelp"] button,
+            button[aria-label="View help for this widget"],
+            button[aria-label*="help" i] {
+                width: 18px !important;
+                height: 18px !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                border: 1px solid #64748b !important;
+                border-radius: 50% !important;
+                background: transparent !important;
+                color: #e2e8f0 !important;
+                padding: 0 !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                box-shadow: none !important;
+                font-size: 0 !important;
+                line-height: 1 !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button svg,
+            [data-testid="stWidgetLabelHelp"] button svg *,
+            button[aria-label="View help for this widget"] svg,
+            button[aria-label="View help for this widget"] svg *,
+            button[aria-label*="help" i] svg,
+            button[aria-label*="help" i] svg * {
+                display: none !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button::before,
+            button[aria-label="View help for this widget"]::before,
+            button[aria-label*="help" i]::before {
+                content: "?" !important;
+                color: #e2e8f0 !important;
+                font-size: 11px !important;
+                font-weight: 700 !important;
+                line-height: 1 !important;
+            }
+            [role="tooltip"],
+            div[data-baseweb="tooltip"],
+            div[data-baseweb="tooltip"] * {
+                background: #0f172a !important;
+                color: #e2e8f0 !important;
+                border-color: #334155 !important;
+            }
+            /* Final fallback: render visible ? on help-icon container, keep real button transparent for hover */
+            [data-testid="stWidgetLabelHelp"] {
+                position: relative !important;
+                display: inline-flex !important;
+                width: 18px !important;
+                height: 18px !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                align-items: center !important;
+                justify-content: center !important;
+                border: 1px solid #64748b !important;
+                border-radius: 50% !important;
+                background: transparent !important;
+            }
+            [data-testid="stWidgetLabelHelp"]::before {
+                content: "?" !important;
+                color: #e2e8f0 !important;
+                font-size: 11px !important;
+                font-weight: 700 !important;
+                line-height: 1 !important;
+                pointer-events: none !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button {
+                position: absolute !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                opacity: 0 !important;
+                background: transparent !important;
+                border: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                z-index: 2 !important;
+            }
             </style>
             """
         else:
@@ -640,6 +732,18 @@ class AuthManager:
             .info-box { color: #1e3a8a !important; border-color: #bfdbfe !important; background: #eff6ff !important; }
             .stSelectbox > div > div { background: #e3f2fd !important; border: 1px solid #dbe3ee !important; }
             .stSelectbox > div > div * { color: #0f172a !important; fill: #0f172a !important; }
+            [data-testid="stWidgetLabelHelp"] button {
+                color: #334155 !important;
+                background: transparent !important;
+                border: 1px solid #94a3b8 !important;
+                border-radius: 999px !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button svg,
+            [data-testid="stWidgetLabelHelp"] svg {
+                color: #334155 !important;
+                fill: #334155 !important;
+                stroke: #334155 !important;
+            }
             [data-testid="stFileUploaderDropzone"], [data-testid="stFileUploaderDropzone"] * { background: #ffffff !important; color: #0f172a !important; border-color: #e2e8f0 !important; }
             .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stNumberInput input { background: #ffffff !important; color: #0f172a !important; border-color: #c9d7e8 !important; }
             .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #64748b !important; opacity: 1 !important; }
@@ -654,6 +758,86 @@ class AuthManager:
             .stButton button[kind="primary"], .stButton button[kind="secondary"], .stFormSubmitButton button { background: #f8fafc !important; color: #0f172a !important; border: 1px solid #cbd5e1 !important; }
             a { color: #0369a1 !important; }
             [data-testid="stCaptionContainer"] p, small { color: #475569 !important; }
+            /* Help icon visibility + tooltip readability (light theme) */
+            [data-testid="stWidgetLabelHelp"] button,
+            button[aria-label="View help for this widget"],
+            button[aria-label*="help" i] {
+                width: 18px !important;
+                height: 18px !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                border: 1px solid #94a3b8 !important;
+                border-radius: 50% !important;
+                background: transparent !important;
+                color: #334155 !important;
+                padding: 0 !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                box-shadow: none !important;
+                font-size: 0 !important;
+                line-height: 1 !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button svg,
+            [data-testid="stWidgetLabelHelp"] button svg *,
+            button[aria-label="View help for this widget"] svg,
+            button[aria-label="View help for this widget"] svg *,
+            button[aria-label*="help" i] svg,
+            button[aria-label*="help" i] svg * {
+                display: none !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button::before,
+            button[aria-label="View help for this widget"]::before,
+            button[aria-label*="help" i]::before {
+                content: "?" !important;
+                color: #334155 !important;
+                font-size: 11px !important;
+                font-weight: 700 !important;
+                line-height: 1 !important;
+            }
+            [role="tooltip"],
+            div[data-baseweb="tooltip"],
+            div[data-baseweb="tooltip"] * {
+                background: #ffffff !important;
+                color: #0f172a !important;
+                border-color: #cbd5e1 !important;
+            }
+            /* Final fallback: render visible ? on help-icon container, keep real button transparent for hover */
+            [data-testid="stWidgetLabelHelp"] {
+                position: relative !important;
+                display: inline-flex !important;
+                width: 18px !important;
+                height: 18px !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                align-items: center !important;
+                justify-content: center !important;
+                border: 1px solid #94a3b8 !important;
+                border-radius: 50% !important;
+                background: #ffffff !important;
+            }
+            [data-testid="stWidgetLabelHelp"]::before {
+                content: "?" !important;
+                color: #334155 !important;
+                font-size: 11px !important;
+                font-weight: 700 !important;
+                line-height: 1 !important;
+                pointer-events: none !important;
+            }
+            [data-testid="stWidgetLabelHelp"] button {
+                position: absolute !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                min-width: 18px !important;
+                min-height: 18px !important;
+                opacity: 0 !important;
+                background: transparent !important;
+                border: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                z-index: 2 !important;
+            }
             </style>
             """
         st.markdown(css, unsafe_allow_html=True)

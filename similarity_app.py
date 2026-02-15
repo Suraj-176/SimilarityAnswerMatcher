@@ -9,6 +9,8 @@ import threading
 import shutil
 import hashlib
 import difflib
+import re
+from collections import Counter
 
 from openpyxl.utils import get_column_letter
 import requests
@@ -38,18 +40,70 @@ def _normalized_prompt_value(prompt_value, fallback):
     return fallback
 
 
+def _normalize_similarity_text(text):
+    text = str(text or "").lower().strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _char_ngrams(text, n=3):
+    if len(text) < n:
+        return Counter([text]) if text else Counter()
+    return Counter(text[i : i + n] for i in range(len(text) - n + 1))
+
+
+def _counter_cosine_similarity(c1, c2):
+    if not c1 or not c2:
+        return 0.0
+    keys = set(c1.keys()) | set(c2.keys())
+    dot = sum(c1.get(k, 0) * c2.get(k, 0) for k in keys)
+    n1 = sum(v * v for v in c1.values()) ** 0.5
+    n2 = sum(v * v for v in c2.values()) ** 0.5
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return dot / (n1 * n2)
+
+
 def _lexical_similarity_percent(text1, text2):
-    """Deterministic lexical similarity fallback (0-100)."""
-    a = str(text1 or "").strip().lower()
-    b = str(text2 or "").strip().lower()
+    """Hybrid lexical similarity fallback (0-100) with better quality than raw ratio."""
+    a = _normalize_similarity_text(text1)
+    b = _normalize_similarity_text(text2)
     if not a or not b:
         return 0.0
+
     seq_ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    a_tokens = set(a.split())
-    b_tokens = set(b.split())
-    union = a_tokens | b_tokens
-    jaccard = (len(a_tokens & b_tokens) / len(union)) if union else 0.0
-    score = (0.72 * seq_ratio) + (0.28 * jaccard)
+    a_tokens = a.split()
+    b_tokens = b.split()
+    a_set = set(a_tokens)
+    b_set = set(b_tokens)
+    union = a_set | b_set
+    jaccard = (len(a_set & b_set) / len(union)) if union else 0.0
+
+    # Token-order-insensitive overlap.
+    sorted_ratio = difflib.SequenceMatcher(None, " ".join(sorted(a_tokens)), " ".join(sorted(b_tokens))).ratio()
+
+    # Character n-gram cosine captures near matches/typos.
+    char_cos = _counter_cosine_similarity(_char_ngrams(a, 3), _char_ngrams(b, 3))
+
+    # Numeric consistency is important for answer matching.
+    nums_a = set(re.findall(r"\d+(?:\.\d+)?", a))
+    nums_b = set(re.findall(r"\d+(?:\.\d+)?", b))
+    if nums_a or nums_b:
+        num_union = nums_a | nums_b
+        num_score = (len(nums_a & nums_b) / len(num_union)) if num_union else 0.0
+    else:
+        num_score = 1.0
+
+    score = (
+        0.40 * seq_ratio
+        + 0.20 * jaccard
+        + 0.20 * sorted_ratio
+        + 0.15 * char_cos
+        + 0.05 * num_score
+    )
     return round(max(0.0, min(1.0, score)) * 100.0, 2)
 
 

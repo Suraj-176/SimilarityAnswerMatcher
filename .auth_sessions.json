@@ -32,9 +32,18 @@
       "username": "Dummy",
       "role": "user",
       "created_at": "2026-02-15T07:26:57Z",
-      "updated_at": "2026-02-15T08:49:55Z",
+      "updated_at": "2026-02-15T09:05:54Z",
       "created_ts": 1771140417.7773619,
-      "last_activity_ts": 1771145395.7705905
+      "last_activity_ts": 1771146354.8192353
+    },
+    "BUV3Q6vJgk1JJaKPH48ffryzRJ9Pw3kvY63QeTgoIwk": {
+      "user_key": "dummy",
+      "username": "Dummy",
+      "role": "user",
+      "created_at": "2026-02-15T14:38:49Z",
+      "updated_at": "2026-02-15T15:49:28Z",
+      "created_ts": 1771166329.4773467,
+      "last_activity_ts": 1771170568.652085
     }
   }
 }

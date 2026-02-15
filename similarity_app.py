@@ -397,6 +397,40 @@ st.markdown("""
         font-size: 0.9em;
         padding: 0.3em 0.5em;
     }
+
+    /* Keep help icon visible regardless of upstream SVG color overrides */
+    [data-testid="stWidgetLabelHelp"] {
+        position: relative !important;
+        width: 18px !important;
+        height: 18px !important;
+        min-width: 18px !important;
+        min-height: 18px !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border: 1px solid #94a3b8 !important;
+        border-radius: 50% !important;
+        background: transparent !important;
+    }
+    [data-testid="stWidgetLabelHelp"]::before {
+        content: "?" !important;
+        color: #334155 !important;
+        font-size: 11px !important;
+        font-weight: 700 !important;
+        line-height: 1 !important;
+        pointer-events: none !important;
+    }
+    [data-testid="stWidgetLabelHelp"] button {
+        position: absolute !important;
+        inset: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+        opacity: 0 !important;
+        background: transparent !important;
+        border: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
     
     /* Text inputs */
     .stTextInput > div > div > input {
@@ -1009,6 +1043,12 @@ method_col, api_col_main, model_col_main, icon_col_main = st.columns([3.8, 3.1, 
 # Read matching choice from query params (cards use ?matching=... links)
 # Only use URL param to set an initial default if the session state has no selection yet.
 provider_aliases = {
+    "OpenAI GPT-4o": "OpenAI GPT-4o",
+    "Groq": "Groq",
+    "OpenRouter": "OpenRouter",
+    "xAI Grok": "xAI Grok",
+    "Google Gemini": "Google Gemini",
+    "Anthropic Claude": "Anthropic Claude",
     "OpenAI GPT-4o (API)": "OpenAI GPT-4o",
     "Groq (API)": "Groq",
     "OpenRouter (API)": "OpenRouter",
@@ -1024,12 +1064,12 @@ provider_aliases = {
 
 matching_display_map = {
     "Azure OpenAI GPT-4o": "Azure OpenAI GPT-4o",
-    "OpenAI GPT-4o (API)": "OpenAI GPT-4o",
-    "Groq (API)": "Groq",
-    "OpenRouter (API)": "OpenRouter",
-    "xAI Grok (API)": "xAI Grok",
-    "Google Gemini (API)": "Google Gemini",
-    "Anthropic Claude (API)": "Anthropic Claude",
+    "OpenAI GPT-4o": "OpenAI GPT-4o",
+    "Groq": "Groq",
+    "OpenRouter": "OpenRouter",
+    "xAI Grok": "xAI Grok",
+    "Google Gemini": "Google Gemini",
+    "Anthropic Claude": "Anthropic Claude",
     "Local Model": "Local Model",
 }
 
@@ -1055,6 +1095,17 @@ with method_col:
     # Use the internal labels as radio options; we'll inject CSS to show badges and subtitles
     from ai_providers import PROVIDERS
     matching_display_options = list(matching_display_map.keys())
+    # Migrate older stored display labels (with "(API)") to the new labels.
+    legacy_display_map = {
+        "OpenAI GPT-4o (API)": "OpenAI GPT-4o",
+        "Groq (API)": "Groq",
+        "OpenRouter (API)": "OpenRouter",
+        "xAI Grok (API)": "xAI Grok",
+        "Google Gemini (API)": "Google Gemini",
+        "Anthropic Claude (API)": "Anthropic Claude",
+    }
+    if st.session_state.get("matching_method_select") in legacy_display_map:
+        st.session_state["matching_method_select"] = legacy_display_map[st.session_state["matching_method_select"]]
     # Determine default index from session_state (default to Azure)
     current = st.session_state.get('matching_method', 'Azure OpenAI GPT-4o')
     current = provider_aliases.get(current, current)
@@ -1092,9 +1143,18 @@ selected_model = None
 
 if matching_method == "Local Model":
     with api_col_main:
+        local_cache_root = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "torch",
+            "sentence_transformers",
+        )
+        cached_mpnet = os.path.join(local_cache_root, "sentence-transformers_all-mpnet-base-v2")
+        cached_minilm = os.path.join(local_cache_root, "sentence-transformers_all-MiniLM-L6-v2")
+
         SUPPORTED_LOCAL_MODELS = {
-            "all-MiniLM-L6-v2 (Fast)": "all-MiniLM-L6-v2",
-            "all-mpnet-base-v2 (Accurate)": "all-mpnet-base-v2"
+            "all-MiniLM-L6-v2 (Fast)": cached_minilm if os.path.isdir(cached_minilm) else "all-MiniLM-L6-v2",
+            "all-mpnet-base-v2 (Accurate)": cached_mpnet if os.path.isdir(cached_mpnet) else "all-mpnet-base-v2",
         }
         model_options = list(SUPPORTED_LOCAL_MODELS.keys())
         # default to all-mpnet-base-v2 (Accurate) when available
@@ -1775,6 +1835,32 @@ summary_html = f"""
 """
 st.markdown(summary_html, unsafe_allow_html=True)
 
+# Theme-aware override for widget help icons + tooltip readability.
+help_icon_border = "#64748b" if is_dark_theme else "#94a3b8"
+help_icon_text = "#e2e8f0" if is_dark_theme else "#334155"
+help_tt_bg = "#0f172a" if is_dark_theme else "#ffffff"
+help_tt_text = "#e2e8f0" if is_dark_theme else "#0f172a"
+help_tt_border = "#334155" if is_dark_theme else "#cbd5e1"
+st.markdown(
+    f"""
+<style>
+[data-testid="stWidgetLabelHelp"] {{
+    border: 1px solid {help_icon_border} !important;
+    background: transparent !important;
+}}
+[data-testid="stWidgetLabelHelp"]::before {{
+    color: {help_icon_text} !important;
+}}
+[role="tooltip"], div[data-baseweb="tooltip"], div[data-baseweb="tooltip"] * {{
+    background: {help_tt_bg} !important;
+    color: {help_tt_text} !important;
+    border-color: {help_tt_border} !important;
+}}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 # --- Upload Files (Modified based on mode) ---
 # Visible heading should preserve numbering (3) but not include the word 'Step'
 st.markdown("""
@@ -2030,7 +2116,26 @@ def load_main_model(selected_model):
     except Exception:
         # Fallback mode: keep Local Model usable without hard dependency failure.
         return _FallbackSentenceModel()
-    return SentenceTransformer(selected_model)
+
+    # Try requested model first.
+    try:
+        return SentenceTransformer(selected_model)
+    except Exception:
+        # If a non-cached model (or broken path) was selected, fall back to cached mpnet if available.
+        fallback_cached = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "torch",
+            "sentence_transformers",
+            "sentence-transformers_all-mpnet-base-v2",
+        )
+        if os.path.isdir(fallback_cached):
+            try:
+                return SentenceTransformer(fallback_cached)
+            except Exception:
+                pass
+        # Final safety net.
+        return _FallbackSentenceModel()
 
 
 @st.cache_resource
@@ -2085,6 +2190,53 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
         return score_val, (explanation or "")
     except Exception as e:
         return fallback_score, f"Provider error: {e}"
+
+
+def _warn_on_provider_issues(provider_name, model_name, explanations):
+    """Surface provider/API failures that were silently falling back to lexical scoring."""
+    if not explanations:
+        return
+
+    issue_tokens = (
+        "provider error",
+        "api error",
+        "fallback",
+        "unauthorized",
+        "forbidden",
+        "invalid",
+        "timeout",
+        "rate limit",
+        "not found",
+        "no score",
+        "non-numeric",
+    )
+    issue_messages = []
+    for exp in explanations:
+        text = str(exp or "").strip()
+        low = text.lower()
+        if text and any(tok in low for tok in issue_tokens):
+            issue_messages.append(text)
+    if not issue_messages:
+        return
+
+    # Keep the warning compact while still actionable.
+    sample = " | ".join(list(dict.fromkeys(issue_messages))[:2])
+    model_hint = f" ({model_name})" if model_name else ""
+    st.warning(
+        f"{provider_name}{model_hint}: {len(issue_messages)} row(s) used fallback scoring due provider/API responses. {sample}"
+    )
+
+
+def _notify_local_backend(main_model):
+    """Show one-time notice about which local backend is active."""
+    if isinstance(main_model, _FallbackSentenceModel):
+        if not st.session_state.get("_local_backend_notice_fallback", False):
+            st.warning("Local Model is using lightweight fallback scoring because transformer model loading was unavailable.")
+            st.session_state["_local_backend_notice_fallback"] = True
+    else:
+        if not st.session_state.get("_local_backend_notice_transformer", False):
+            st.info("Local Model is running with sentence-transformers backend.")
+            st.session_state["_local_backend_notice_transformer"] = True
 
 
 # Legacy function for backward compatibility
@@ -2148,9 +2300,6 @@ if compare_clicked:
     except Exception:
         SentenceTransformer = None
         util = _FallbackUtil()
-        if not st.session_state.get("_local_fallback_notice_shown", False):
-            st.info("Local Model is running in lightweight fallback mode because 'sentence-transformers' is not installed.")
-            st.session_state["_local_fallback_notice_shown"] = True
     try:
         CrossEncoder = None
         ce_mod = importlib.import_module('sentence_transformers.cross_encoder')
@@ -2282,6 +2431,7 @@ if compare_clicked:
                             gpt_explanations.append(explanation)
                             progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                         progress.empty()
+                        _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                         final_percent_sim = gpt_scores
                         explanations = gpt_explanations
                         raw_sim = [None] * min_len
@@ -2292,6 +2442,8 @@ if compare_clicked:
                                 st.info("Comparison cancelled before model loading.")
                                 raise Exception("Cancelled")
                             main_model = load_main_model(selected_model)
+                            _notify_local_backend(main_model)
+                            cross_encoder = None
                             n = min_len
                             chunk_size = 64
                             progress = st.progress(0, text="Encoding and computing local similarities...")
@@ -2358,14 +2510,18 @@ if compare_clicked:
                                     except Exception:
                                         pass
 
-                            from difflib import SequenceMatcher
+                                from difflib import SequenceMatcher
                             def fuzzy_ratio(a, b):
                                 return int(SequenceMatcher(None, a, b).ratio() * 100)
                             fuzzy_scores = [fuzzy_ratio(a1, a2) for a1, a2 in zip(cleaned1, cleaned2)]
+                            lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(answers1, answers2)]
                             if cross_encoder is not None and cross_scores is not None:
                                 final_percent_sim = cross_scores
                             else:
-                                final_percent_sim = [max(mpnet, fuzz) for mpnet, fuzz in zip(percent_sim_mpnet, fuzzy_scores)]
+                                final_percent_sim = [
+                                    max(float(mpnet), float(fuzz), float(lex))
+                                    for mpnet, fuzz, lex in zip(percent_sim_mpnet, fuzzy_scores, lexical_scores)
+                                ]
                             raw_sim = raw_sim_mpnet
                         else:
                             final_percent_sim = [None] * min_len
@@ -2557,6 +2713,7 @@ if compare_clicked:
                                 gpt_explanations.append(f"A:{e_a} | B:{e_b}")
                                 progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                             progress.empty()
+                            _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                             final_percent_sim_a = gpt_scores_a
                             final_percent_sim_b = gpt_scores_b
                             explanations = gpt_explanations
@@ -2568,6 +2725,8 @@ if compare_clicked:
                                     st.info("Comparison cancelled before model loading.")
                                     raise Exception("Cancelled")
                                 main_model = load_main_model(selected_model)
+                                _notify_local_backend(main_model)
+                                cross_encoder = None
                                 n = min_len
                                 chunk_size = 64
                                 progress = st.progress(0, text="Encoding and computing local similarities...")
@@ -2669,8 +2828,16 @@ if compare_clicked:
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
                                 fuzzy_a = [fuzzy_ratio(a,b) for a,b in zip(cleaned_base, cleaned_a)]
                                 fuzzy_b = [fuzzy_ratio(a,b) for a,b in zip(cleaned_base, cleaned_b)]
-                                final_percent_sim_a = [max(mpnet, fuzz) for mpnet, fuzz in zip(cross_scores_a, fuzzy_a)]
-                                final_percent_sim_b = [max(mpnet, fuzz) for mpnet, fuzz in zip(cross_scores_b, fuzzy_b)]
+                                lexical_a = [_lexical_similarity_percent(a, b) for a, b in zip(base_vals, target_a_vals)]
+                                lexical_b = [_lexical_similarity_percent(a, b) for a, b in zip(base_vals, target_b_vals)]
+                                final_percent_sim_a = [
+                                    max(float(mpnet), float(fuzz), float(lex))
+                                    for mpnet, fuzz, lex in zip(cross_scores_a, fuzzy_a, lexical_a)
+                                ]
+                                final_percent_sim_b = [
+                                    max(float(mpnet), float(fuzz), float(lex))
+                                    for mpnet, fuzz, lex in zip(cross_scores_b, fuzzy_b, lexical_b)
+                                ]
                                 raw_sim_a = raw_a
                                 raw_sim_b = raw_b
                             else:
@@ -2839,6 +3006,7 @@ if compare_clicked:
                                 gpt_explanations.append(explanation)
                                 progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                             progress.empty()
+                            _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                             final_percent_sim = gpt_scores
                             explanations = gpt_explanations
                             raw_sim = [None] * min_len
@@ -2849,6 +3017,8 @@ if compare_clicked:
                                     st.info("Comparison cancelled before model loading.")
                                     raise Exception("Cancelled")
                                 main_model = load_main_model(selected_model)
+                                _notify_local_backend(main_model)
+                                cross_encoder = None
                                 n = min_len
                                 chunk_size = 64
                                 progress = st.progress(0, text="Encoding and computing local similarities...")
@@ -2921,10 +3091,14 @@ if compare_clicked:
                                 def fuzzy_ratio(a, b):
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
                                 fuzzy_scores = [fuzzy_ratio(a, b) for a, b in zip(cleaned1, cleaned2)]
+                                lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(answers1, answers2)]
                                 if not isinstance(main_model, _FallbackSentenceModel) and cross_encoder is not None and cross_scores is not None:
                                     final_percent_sim = cross_scores
                                 else:
-                                    final_percent_sim = [max(mpnet, fuzz) for mpnet, fuzz in zip(percent_sim_mpnet, fuzzy_scores)]
+                                    final_percent_sim = [
+                                        max(float(mpnet), float(fuzz), float(lex))
+                                        for mpnet, fuzz, lex in zip(percent_sim_mpnet, fuzzy_scores, lexical_scores)
+                                    ]
                                 raw_sim = raw_sim_mpnet
                             else:
                                 final_percent_sim = [None] * min_len
@@ -3316,12 +3490,14 @@ if compare_clicked:
                                                 above_thresh = int((numeric_sim >= threshold).sum())
                                                 between_40_thresh = int(((numeric_sim >= 40) & (numeric_sim < threshold)).sum())
                                                 below_40 = int((numeric_sim < 40).sum())
+                                                avg_similarity = round(float(numeric_sim.mean()), 2) if total_pairs > 0 else 0
                                             else:
                                                 total_pairs = len(res_df)
                                                 above_thresh = between_40_thresh = below_40 = 0
+                                                avg_similarity = 0
                                             summary_df = pd.DataFrame({
-                                                "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "High Threshold (%)"],
-                                                "Value": [total_pairs, above_thresh, between_40_thresh, below_40, threshold]
+                                                "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "Average Similarity (%)", "High Threshold (%)"],
+                                                "Value": [total_pairs, above_thresh, between_40_thresh, below_40, avg_similarity, threshold]
                                             })
                                             # sheet name for summary
                                             summary_name = (f"{s} Summary"[:28] + '...') if len(f"{s} Summary") > 31 else f"{s} Summary"
@@ -3362,12 +3538,14 @@ if compare_clicked:
                                             above_thresh = int((numeric_sim >= threshold).sum())
                                             between_40_thresh = int(((numeric_sim >= 40) & (numeric_sim < threshold)).sum())
                                             below_40 = int((numeric_sim < 40).sum())
+                                            avg_similarity = round(float(numeric_sim.mean()), 2) if total_pairs > 0 else 0
                                         else:
                                             total_pairs = len(res_df)
                                             above_thresh = between_40_thresh = below_40 = 0
+                                            avg_similarity = 0
                                         summary_df = pd.DataFrame({
-                                            "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "High Threshold (%)"],
-                                            "Value": [total_pairs, above_thresh, between_40_thresh, below_40, threshold]
+                                            "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "Average Similarity (%)", "High Threshold (%)"],
+                                            "Value": [total_pairs, above_thresh, between_40_thresh, below_40, avg_similarity, threshold]
                                         })
                                         # sheet name for summary
                                         summary_name = (f"{s} Summary"[:28] + '...') if len(f"{s} Summary") > 31 else f"{s} Summary"
@@ -3426,12 +3604,14 @@ if compare_clicked:
                                         above_thresh = int((numeric_sim >= threshold).sum())
                                         between_40_thresh = int(((numeric_sim >= 40) & (numeric_sim < threshold)).sum())
                                         below_40 = int((numeric_sim < 40).sum())
+                                        avg_similarity = round(float(numeric_sim.mean()), 2) if total_pairs > 0 else 0
                                     else:
                                         total_pairs = len(slim)
                                         above_thresh = between_40_thresh = below_40 = 0
+                                        avg_similarity = 0
                                     summary_df = pd.DataFrame({
-                                        "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "High Threshold (%)"],
-                                        "Value": [total_pairs, above_thresh, between_40_thresh, below_40, threshold]
+                                        "Metric": ["Total Pairs", f"Above {threshold}%", f"Between 40-{threshold}%", "Below 40%", "Average Similarity (%)", "High Threshold (%)"],
+                                        "Value": [total_pairs, above_thresh, between_40_thresh, below_40, avg_similarity, threshold]
                                     })
                                     summary_name = (f"{writer_sheet_name} Summary"[:28] + '...') if len(f"{writer_sheet_name} Summary") > 31 else f"{writer_sheet_name} Summary"
                                     summary_df.to_excel(writer, index=False, sheet_name=summary_name)
@@ -3484,14 +3664,16 @@ if compare_clicked:
                             above_thresh = int((numeric_sim >= threshold).sum())
                             between_40_thresh = int(((numeric_sim >= 40) & (numeric_sim < threshold)).sum())
                             below_40 = int((numeric_sim < 40).sum())
+                            avg_similarity = round(float(numeric_sim.mean()), 2) if total_pairs > 0 else 0
                             # Also include below 50% as an additional metric (kept for backward compatibility)
                             below_50 = int((numeric_sim < 50).sum())
                         else:
                             # Fallback counts when similarity column isn't available
                             total_pairs = len(df_stats) if df_stats is not None else 0
                             above_thresh = between_40_thresh = below_40 = below_50 = 0
+                            avg_similarity = 0
                     except Exception:
-                        total_pairs = above_thresh = between_40_thresh = below_40 = below_50 = ""
+                        total_pairs = above_thresh = between_40_thresh = below_40 = below_50 = avg_similarity = ""
 
                     summary_df = pd.DataFrame({
                         "Metric": [
@@ -3499,9 +3681,10 @@ if compare_clicked:
                             f"Above {threshold}%",
                             f"Between 40-{threshold}%",
                             "Below 40%",
+                            "Average Similarity (%)",
                             "High Threshold (%)"
                         ],
-                        "Value": [total_pairs, above_thresh, between_40_thresh, below_40, threshold]
+                        "Value": [total_pairs, above_thresh, between_40_thresh, below_40, avg_similarity, threshold]
                     })
                     # Determine a descriptive summary sheet name that includes the compared sheet when possible
                     try:

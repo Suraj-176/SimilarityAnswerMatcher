@@ -4,19 +4,25 @@ import numpy as np
 import io
 import os
 import json
+import logging
 import subprocess
 import threading
 import shutil
 import hashlib
 import difflib
 import re
+import sys
+import traceback
 from collections import Counter
 
 from openpyxl.utils import get_column_letter
 import requests
 import streamlit.components.v1 as components
 from model_configs import get_default_provider_model, get_model_parameters, get_provider_model_options
-from auth import check_authentication, show_user_info, get_current_user_key
+from auth import ERROR_LOG_PATH, check_authentication, show_user_info, get_current_user_key
+
+
+logger = logging.getLogger(__name__)
 
 
 if not check_authentication():
@@ -105,6 +111,32 @@ def _lexical_similarity_percent(text1, text2):
         + 0.05 * num_score
     )
     return round(max(0.0, min(1.0, score)) * 100.0, 2)
+
+
+def _get_available_local_models():
+    """Return locally installed sentence-transformer model options only."""
+    local_cache_root = os.path.join(
+        os.path.expanduser("~"),
+        ".cache",
+        "torch",
+        "sentence_transformers",
+    )
+    cached_mpnet = os.path.join(local_cache_root, "sentence-transformers_all-mpnet-base-v2")
+    cached_minilm = os.path.join(local_cache_root, "sentence-transformers_all-MiniLM-L6-v2")
+    options = {}
+    if os.path.isdir(cached_mpnet):
+        options["all-mpnet-base-v2 (Accurate)"] = cached_mpnet
+    if os.path.isdir(cached_minilm):
+        options["all-MiniLM-L6-v2 (Fast)"] = cached_minilm
+    return options
+
+
+def _has_sentence_transformers() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except Exception:
+        return False
 
 
 def read_uploaded_file(uploaded_file, sheet_name=None):
@@ -1140,41 +1172,42 @@ if 'matching_method' not in st.session_state:
 
 matching_method = st.session_state.get('matching_method', 'Azure OpenAI GPT-4o')
 selected_model = None
+local_backend_ready = _has_sentence_transformers()
 
 if matching_method == "Local Model":
     with api_col_main:
-        local_cache_root = os.path.join(
-            os.path.expanduser("~"),
-            ".cache",
-            "torch",
-            "sentence_transformers",
-        )
-        cached_mpnet = os.path.join(local_cache_root, "sentence-transformers_all-mpnet-base-v2")
-        cached_minilm = os.path.join(local_cache_root, "sentence-transformers_all-MiniLM-L6-v2")
-
-        SUPPORTED_LOCAL_MODELS = {
-            "all-MiniLM-L6-v2 (Fast)": cached_minilm if os.path.isdir(cached_minilm) else "all-MiniLM-L6-v2",
-            "all-mpnet-base-v2 (Accurate)": cached_mpnet if os.path.isdir(cached_mpnet) else "all-mpnet-base-v2",
-        }
-        model_options = list(SUPPORTED_LOCAL_MODELS.keys())
-        # default to all-mpnet-base-v2 (Accurate) when available
-        try:
-            default_idx = model_options.index("all-mpnet-base-v2 (Accurate)")
-        except ValueError:
-            default_idx = 0
+        available_local_models = _get_available_local_models() if local_backend_ready else {}
         st.markdown("<div class='step2-field-label'>Select Local Language Model</div>", unsafe_allow_html=True)
-        selected_model_name = st.selectbox(
-            "Select Local Language Model",
-            model_options,
-            index=default_idx,
-            key="local_model_select_main",
-            help="Local model: all-mpnet-base-v2 (Accurate).",
-            label_visibility="collapsed",
-        )
-        selected_model = SUPPORTED_LOCAL_MODELS[selected_model_name]
-        # show brief hoverable info via tooltip; keep a small inline note for clarity
-        st.write(" ")
-        # caption intentionally removed per user request
+        if not local_backend_ready:
+            selected_model = None
+            st.error(
+                "Local Model backend is not available in the Python runtime used by Streamlit."
+            )
+            st.caption(
+                f"Install in this runtime: `{sys.executable} -m pip install sentence-transformers torch`"
+            )
+        elif not available_local_models:
+            selected_model = None
+            st.error(
+                "No installed local models found. Install/cache a local sentence-transformer model first "
+                "(e.g., all-mpnet-base-v2), then retry."
+            )
+        else:
+            model_options = list(available_local_models.keys())
+            # default to all-mpnet-base-v2 (Accurate) when available
+            try:
+                default_idx = model_options.index("all-mpnet-base-v2 (Accurate)")
+            except ValueError:
+                default_idx = 0
+            selected_model_name = st.selectbox(
+                "Select Local Language Model",
+                model_options,
+                index=default_idx,
+                key="local_model_select_main",
+                help="Only locally installed models are listed.",
+                label_visibility="collapsed",
+            )
+            selected_model = available_local_models[selected_model_name]
         # Selecting a local model should close any cloud provider advanced settings
         st.session_state['show_advanced_gpt'] = False
 else:
@@ -2107,35 +2140,22 @@ class _FallbackSentenceModel:
 
 @st.cache_resource
 def load_main_model(selected_model):
-    # Import inside the function so the app can still run parts of the UI
-    # when sentence-transformers is not installed.
+    # Strict local mode: selected model must load successfully.
+    if not selected_model:
+        raise RuntimeError("No local model is available. Install at least one local sentence-transformer model and retry.")
     try:
         import importlib
         st_mod = importlib.import_module('sentence_transformers')
         SentenceTransformer = getattr(st_mod, 'SentenceTransformer')
-    except Exception:
-        # Fallback mode: keep Local Model usable without hard dependency failure.
-        return _FallbackSentenceModel()
-
-    # Try requested model first.
+    except Exception as e:
+        raise RuntimeError(
+            "Local Model requires 'sentence-transformers' in the same Python runtime used by Streamlit. "
+            f"Runtime: {sys.executable}. Install with: {sys.executable} -m pip install sentence-transformers torch"
+        ) from e
     try:
         return SentenceTransformer(selected_model)
-    except Exception:
-        # If a non-cached model (or broken path) was selected, fall back to cached mpnet if available.
-        fallback_cached = os.path.join(
-            os.path.expanduser("~"),
-            ".cache",
-            "torch",
-            "sentence_transformers",
-            "sentence-transformers_all-mpnet-base-v2",
-        )
-        if os.path.isdir(fallback_cached):
-            try:
-                return SentenceTransformer(fallback_cached)
-            except Exception:
-                pass
-        # Final safety net.
-        return _FallbackSentenceModel()
+    except Exception as e:
+        raise RuntimeError(f"Failed to load selected local model: {selected_model}") from e
 
 
 @st.cache_resource
@@ -2165,7 +2185,6 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
     # Pass a template string; providers perform the final format(answer1, answer2).
     prompt_template = _normalized_prompt_value(user_template, DEFAULT_USER_PROMPT_TEMPLATE)
     sys_content = _normalized_prompt_value(system_prompt, DEFAULT_SYSTEM_PROMPT)
-    fallback_score = _lexical_similarity_percent(answer1, answer2)
     safe_max_tokens = max(16, int(max_tokens or 20))
 
     try:
@@ -2175,64 +2194,27 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
             temperature, top_p, safe_max_tokens, model_name=model_name
         )
         if score is None:
-            return fallback_score, (explanation or "Provider returned no score. Using lexical fallback.")
+            return None, (explanation or "Provider returned no score.")
         try:
             score_val = float(score)
         except Exception:
-            return fallback_score, "Provider returned non-numeric score. Using lexical fallback."
+            return None, "Provider returned non-numeric score."
         if 0.0 <= score_val <= 1.0 and score_val not in (0.0, 1.0):
             score_val = round(score_val * 100.0, 2)
         score_val = max(0.0, min(100.0, score_val))
         if score_val == 0.0 and isinstance(explanation, str):
             low_exp = explanation.lower()
             if any(tok in low_exp for tok in ["error", "failed", "timeout", "invalid", "unauthorized", "forbidden"]):
-                return fallback_score, explanation
+                return None, explanation
         return score_val, (explanation or "")
     except Exception as e:
-        return fallback_score, f"Provider error: {e}"
-
-
-def _warn_on_provider_issues(provider_name, model_name, explanations):
-    """Surface provider/API failures that were silently falling back to lexical scoring."""
-    if not explanations:
-        return
-
-    issue_tokens = (
-        "provider error",
-        "api error",
-        "fallback",
-        "unauthorized",
-        "forbidden",
-        "invalid",
-        "timeout",
-        "rate limit",
-        "not found",
-        "no score",
-        "non-numeric",
-    )
-    issue_messages = []
-    for exp in explanations:
-        text = str(exp or "").strip()
-        low = text.lower()
-        if text and any(tok in low for tok in issue_tokens):
-            issue_messages.append(text)
-    if not issue_messages:
-        return
-
-    # Keep the warning compact while still actionable.
-    sample = " | ".join(list(dict.fromkeys(issue_messages))[:2])
-    model_hint = f" ({model_name})" if model_name else ""
-    st.warning(
-        f"{provider_name}{model_hint}: {len(issue_messages)} row(s) used fallback scoring due provider/API responses. {sample}"
-    )
+        return None, f"Provider error: {e}"
 
 
 def _notify_local_backend(main_model):
     """Show one-time notice about which local backend is active."""
     if isinstance(main_model, _FallbackSentenceModel):
-        if not st.session_state.get("_local_backend_notice_fallback", False):
-            st.warning("Local Model is using lightweight fallback scoring because transformer model loading was unavailable.")
-            st.session_state["_local_backend_notice_fallback"] = True
+        raise RuntimeError("Local fallback backend is disabled in strict local mode.")
     else:
         if not st.session_state.get("_local_backend_notice_transformer", False):
             st.info("Local Model is running with sentence-transformers backend.")
@@ -2271,10 +2253,16 @@ if ready_to_compare:
             st.session_state["cancel_requested"] = False
         # Disable Compare for cloud providers when API key is missing.
         is_local_mode = (matching_method == "Local Model")
-        disable_compare = (not is_local_mode) and (not api_key)
+        local_ready = (local_backend_ready and bool(selected_model)) if is_local_mode else True
+        disable_compare = ((not is_local_mode) and (not api_key)) or (is_local_mode and (not local_ready))
         compare_clicked = st.button("Compare", help="Click to start the similarity comparison", disabled=disable_compare)
         if disable_compare:
-            st.caption(f"Enter {matching_method} API Key to enable Compare")
+            if is_local_mode and not local_backend_ready:
+                st.caption("Install sentence-transformers in the Streamlit runtime to enable Local Model.")
+            elif is_local_mode and not selected_model:
+                st.caption("Install/cache at least one local model to enable Compare.")
+            else:
+                st.caption(f"Enter {matching_method} API Key to enable Compare")
     with col_cancel:
         # Cancel button sets a request flag; cancellation is best-effort and works for loops
         if st.button("Cancel", help="Request cancellation of running comparison"):
@@ -2369,7 +2357,7 @@ if compare_clicked:
 
                     def aggressive_clean(ans):
                         ans = clean_answer(ans)
-                        ans = re.sub(r'\d+', '', ans)
+                        # Preserve numeric tokens so "25" vs "70" are not treated as identical.
                         context_phrases = [
                             r'based on the provided context', r'from the context', r'from context', r'context', r'see context',
                             r'as per context', r'per context', r'per the context', r'per the provided context', r'provided context', r'according to'
@@ -2427,11 +2415,14 @@ if compare_clicked:
                                     max_tokens=max_tokens,
                                     model_name=provider_model_name,
                                 )
+                                if score is None:
+                                    raise RuntimeError(
+                                        f"{matching_method} ({provider_model_name}) failed at row {idx + 1}: {explanation}"
+                                    )
                             gpt_scores.append(score if score is not None else 0)
                             gpt_explanations.append(explanation)
                             progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                         progress.empty()
-                        _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                         final_percent_sim = gpt_scores
                         explanations = gpt_explanations
                         raw_sim = [None] * min_len
@@ -2629,7 +2620,7 @@ if compare_clicked:
 
                         def aggressive_clean(ans):
                             ans = clean_answer(ans)
-                            ans = re.sub(r'\d+', '', ans)
+                            # Preserve numeric tokens so quantity/value columns compare correctly.
                             context_phrases = [
                                 r'based on the provided context', r'from the context', r'from context', r'context', r'see context',
                                 r'as per context', r'per context', r'per the context', r'per the provided context', r'provided context', r'according to'
@@ -2683,6 +2674,10 @@ if compare_clicked:
                                         max_tokens=max_tokens,
                                         model_name=provider_model_name,
                                     )
+                                    if s_a is None:
+                                        raise RuntimeError(
+                                            f"{matching_method} ({provider_model_name}) failed at row {idx + 1} for Target A: {e_a}"
+                                        )
                                 if not b.strip() or not c.strip():
                                     s_b, e_b = 0, "Empty base or target B"
                                 else:
@@ -2708,12 +2703,15 @@ if compare_clicked:
                                         max_tokens=max_tokens,
                                         model_name=provider_model_name,
                                     )
+                                    if s_b is None:
+                                        raise RuntimeError(
+                                            f"{matching_method} ({provider_model_name}) failed at row {idx + 1} for Target B: {e_b}"
+                                        )
                                 gpt_scores_a.append(s_a if s_a is not None else 0)
                                 gpt_scores_b.append(s_b if s_b is not None else 0)
                                 gpt_explanations.append(f"A:{e_a} | B:{e_b}")
                                 progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                             progress.empty()
-                            _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                             final_percent_sim_a = gpt_scores_a
                             final_percent_sim_b = gpt_scores_b
                             explanations = gpt_explanations
@@ -2953,7 +2951,7 @@ if compare_clicked:
 
                         def aggressive_clean(ans):
                             ans = clean_answer(ans)
-                            ans = re.sub(r'\d+', '', ans)
+                            # Preserve numeric tokens so quantity/value columns compare correctly.
                             context_phrases = [
                                 r'based on the provided context', r'from the context', r'from context', r'context', r'see context', r'as per context', r'per context', r'per the context', r'per the provided context', r'provided context', r'according to'
                             ]
@@ -2985,11 +2983,11 @@ if compare_clicked:
                                     temp_key = f'{matching_method}_temperature'
                                     top_p_key = f'{matching_method}_top_p'
                                     max_tokens_key = f'{matching_method}_max_tokens'
-                                    
+
                                     temp = st.session_state.get(temp_key, model_params.get('temperature', {}).get('default', 0.0))
                                     top_p = st.session_state.get(top_p_key, model_params.get('top_p', {}).get('default', 1.0))
                                     max_tokens = st.session_state.get(max_tokens_key, model_params.get('max_tokens', {}).get('default', 20))
-                                    
+
                                     score, explanation = get_ai_similarity(
                                         matching_method,
                                         a1,
@@ -3002,11 +3000,14 @@ if compare_clicked:
                                         max_tokens=max_tokens,
                                         model_name=provider_model_name,
                                     )
+                                    if score is None:
+                                        raise RuntimeError(
+                                            f"{matching_method} ({provider_model_name}) failed at row {idx + 1}: {explanation}"
+                                        )
                                 gpt_scores.append(score if score is not None else 0)
                                 gpt_explanations.append(explanation)
                                 progress.progress((idx+1)/min_len, text=f"Compared {idx+1}/{min_len} pairs")
                             progress.empty()
-                            _warn_on_provider_issues(matching_method, provider_model_name, gpt_explanations)
                             final_percent_sim = gpt_scores
                             explanations = gpt_explanations
                             raw_sim = [None] * min_len
@@ -3315,10 +3316,10 @@ if compare_clicked:
                     # Comparison complete; results saved to session and shown below.
                     st.success("Comparison complete — results saved. Use the Download Options and expanders below to inspect or download results.")
     except Exception as e:
+        logger.exception("Error processing files in similarity comparison flow.")
         st.error(f"Error processing files: {e}")
         # --- Error Logging for Debugging ---
-        with open("error_log.txt", "a", encoding="utf-8") as logf:
-            import traceback
+        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as logf:
             logf.write(traceback.format_exc() + "\n")
     # If results exist in session_state (e.g., after a rerun from download), show them
     if st.session_state.get('results_df') is not None:
@@ -3344,14 +3345,6 @@ if compare_clicked:
             results_below_50 = pd.DataFrame()
 
         st.markdown("---")
-        with st.expander("Show highlighted differences", expanded=False):
-            if diff_table is not None and not diff_table.empty:
-                st.markdown("**Highlighted Differences:**")
-                st.write("**Legend:** Red = difference, Green = insertion")
-                st.write("You can scroll the table below to see highlighted differences.")
-                st.write(diff_table.to_html(escape=False), unsafe_allow_html=True)
-            else:
-                st.info("No highlighted differences to show.")
 
         with st.expander("Show full results table", expanded=False):
             st.markdown("**Full Results Table:**")

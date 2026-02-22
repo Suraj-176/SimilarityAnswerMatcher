@@ -6,6 +6,7 @@ OpenRouter, and xAI Grok.
 
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
@@ -81,6 +82,71 @@ class AIProvider(ABC):
             logger.error("Error extracting score: %s", e)
             return 0.0
 
+    @staticmethod
+    def _sanitize_error_text(text: str) -> str:
+        """Redact API keys/tokens from error strings before surfacing to UI/logs."""
+        sanitized = str(text or "")
+        sanitized = re.sub(r"([?&]key=)[^&\s]+", r"\1[REDACTED]", sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1[REDACTED]", sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r"\bsk-[A-Za-z0-9_\-]+\b", "[REDACTED]", sanitized)
+        return sanitized
+
+    @classmethod
+    def _extract_error_detail(cls, response: Optional[requests.Response]) -> str:
+        if response is None:
+            return ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    msg = err.get("message") or err.get("msg") or err.get("detail") or err.get("type")
+                    if code and msg:
+                        return cls._sanitize_error_text(f"{code}: {msg}")
+                    if msg:
+                        return cls._sanitize_error_text(str(msg))
+                    return cls._sanitize_error_text(str(err))
+                if isinstance(err, str):
+                    return cls._sanitize_error_text(err)
+                for key in ("message", "detail"):
+                    if key in payload and payload[key]:
+                        return cls._sanitize_error_text(str(payload[key]))
+                return cls._sanitize_error_text(str(payload))
+            return cls._sanitize_error_text(str(payload))
+        except Exception:
+            body = getattr(response, "text", "") or ""
+            return cls._sanitize_error_text(body[:500])
+
+    @classmethod
+    def _format_requests_error(cls, provider_name: str, exc: requests.exceptions.RequestException) -> str:
+        if isinstance(exc, requests.exceptions.HTTPError):
+            response = exc.response
+            status = response.status_code if response is not None else "unknown"
+            reason = response.reason if response is not None else ""
+            detail = cls._extract_error_detail(response)
+
+            hint = ""
+            if status == 400:
+                hint = "Bad request. Check model name and provider configuration."
+            elif status == 401:
+                hint = "Authentication failed. Check API key."
+            elif status == 403:
+                hint = "Access denied. Check model access/permissions."
+            elif status == 404:
+                hint = "Model/endpoint not found."
+            elif status == 429:
+                hint = "Rate limit or quota exceeded."
+
+            parts = [f"{provider_name} API error ({status}{(' ' + reason) if reason else ''})."]
+            if hint:
+                parts.append(hint)
+            if detail:
+                parts.append(f"Details: {detail}")
+            return " ".join(parts)
+
+        return f"{provider_name} API error: {cls._sanitize_error_text(str(exc))}"
+
 
 class AzureOpenAIProvider(AIProvider):
     """Azure OpenAI GPT provider."""
@@ -124,8 +190,10 @@ class AzureOpenAIProvider(AIProvider):
             content = result["choices"][0]["message"]["content"]
             score = self.extract_score(content)
             return score, content.strip()
+        except requests.exceptions.RequestException as e:
+            return None, self._format_requests_error("Azure OpenAI", e)
         except Exception as e:
-            return None, f"API error: {e}"
+            return None, f"Azure OpenAI unexpected error: {self._sanitize_error_text(str(e))}"
 
 
 class OpenAIGPT4oProvider(AIProvider):
@@ -167,8 +235,10 @@ class OpenAIGPT4oProvider(AIProvider):
             content = result["choices"][0]["message"]["content"]
             score = self.extract_score(content)
             return score, content.strip()
+        except requests.exceptions.RequestException as e:
+            return None, self._format_requests_error("OpenAI", e)
         except Exception as e:
-            return None, f"OpenAI API error: {e}"
+            return None, f"OpenAI unexpected error: {self._sanitize_error_text(str(e))}"
 
 
 class OpenAIGPT4oMiniProvider(OpenAIGPT4oProvider):
@@ -212,32 +282,51 @@ class GroqProvider(AIProvider):
         if temperature > 0:
             data["top_p"] = float(top_p)
 
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            response.raise_for_status()
-            result = response.json()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=data, timeout=30)
+                response.raise_for_status()
+                result = response.json()
 
-            if "choices" not in result or not result["choices"]:
-                error_msg = f"Groq: No choices in response: {result}"
+                if "choices" not in result or not result["choices"]:
+                    error_msg = f"Groq response missing choices. Details: {self._sanitize_error_text(str(result))}"
+                    logger.error(error_msg)
+                    return None, error_msg
+
+                content = result["choices"][0]["message"]["content"]
+                logger.debug("Groq raw response: %s", content)
+                score = self.extract_score(content)
+                return score, content.strip()
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 429 and attempt < max_retries - 1:
+                    wait_seconds = 2 ** attempt
+                    logger.warning(
+                        "Groq rate-limited (429). Retrying in %ss (attempt %s/%s).",
+                        wait_seconds,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                error_msg = self._format_requests_error("Groq", e)
+                logger.error(error_msg)
+                return None, error_msg
+            except requests.exceptions.RequestException as e:
+                error_msg = self._format_requests_error("Groq", e)
+                logger.error(error_msg)
+                return None, error_msg
+            except (KeyError, IndexError) as e:
+                error_msg = f"Groq response parsing error: {self._sanitize_error_text(str(e))}"
+                logger.error(error_msg)
+                return None, error_msg
+            except Exception as e:
+                error_msg = f"Groq unexpected error: {self._sanitize_error_text(str(e))}"
                 logger.error(error_msg)
                 return None, error_msg
 
-            content = result["choices"][0]["message"]["content"]
-            logger.debug("Groq raw response: %s", content)
-            score = self.extract_score(content)
-            return score, content.strip()
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Groq API error: {str(e)}"
-            logger.error(error_msg)
-            return None, error_msg
-        except (KeyError, IndexError) as e:
-            error_msg = f"Groq response parsing error: {str(e)}"
-            logger.error(error_msg)
-            return None, error_msg
-        except Exception as e:
-            error_msg = f"Groq unexpected error: {str(e)}"
-            logger.error(error_msg)
-            return None, error_msg
+        return None, "Groq API error: retries exhausted."
 
 
 class GeminiProvider(AIProvider):
@@ -283,18 +372,24 @@ class GeminiProvider(AIProvider):
             logger.debug("Gemini raw response: %s", result)
 
             if "error" in result:
-                error_msg = f"Gemini API error: {result['error'].get('message', 'Unknown error')}"
+                err_obj = result.get("error", {})
+                err_code = err_obj.get("code") or err_obj.get("status")
+                err_msg = err_obj.get("message", "Unknown error")
+                if err_code:
+                    error_msg = f"Google Gemini API error ({err_code}). Details: {self._sanitize_error_text(err_msg)}"
+                else:
+                    error_msg = f"Google Gemini API error. Details: {self._sanitize_error_text(err_msg)}"
                 logger.error(error_msg)
                 return None, error_msg
 
             if "candidates" not in result or not result["candidates"]:
-                error_msg = f"Gemini: No candidates in response: {result}"
+                error_msg = f"Google Gemini response missing candidates. Details: {self._sanitize_error_text(str(result))}"
                 logger.error(error_msg)
                 return None, error_msg
 
             candidate = result["candidates"][0]
             if "content" not in candidate or "parts" not in candidate["content"] or not candidate["content"]["parts"]:
-                error_msg = f"Gemini: Invalid candidate structure: {candidate}"
+                error_msg = f"Google Gemini response parsing error. Details: {self._sanitize_error_text(str(candidate))}"
                 logger.error(error_msg)
                 return None, error_msg
 
@@ -303,15 +398,15 @@ class GeminiProvider(AIProvider):
             score = self.extract_score(content)
             return score, content.strip()
         except requests.exceptions.RequestException as e:
-            error_msg = f"Gemini API error: {str(e)}"
+            error_msg = self._format_requests_error("Google Gemini", e)
             logger.error(error_msg)
             return None, error_msg
         except (KeyError, IndexError) as e:
-            error_msg = f"Gemini response parsing error: {str(e)}"
+            error_msg = f"Google Gemini response parsing error: {self._sanitize_error_text(str(e))}"
             logger.error(error_msg)
             return None, error_msg
         except Exception as e:
-            error_msg = f"Gemini unexpected error: {str(e)}"
+            error_msg = f"Google Gemini unexpected error: {self._sanitize_error_text(str(e))}"
             logger.error(error_msg)
             return None, error_msg
 
@@ -355,8 +450,10 @@ class GrokProvider(AIProvider):
             content = result["choices"][0]["message"]["content"]
             score = self.extract_score(content)
             return score, content.strip()
+        except requests.exceptions.RequestException as e:
+            return None, self._format_requests_error("xAI Grok", e)
         except Exception as e:
-            return None, f"API error: {e}"
+            return None, f"xAI Grok unexpected error: {self._sanitize_error_text(str(e))}"
 
 
 class ClaudeProvider(AIProvider):
@@ -397,8 +494,10 @@ class ClaudeProvider(AIProvider):
             content = result["content"][0]["text"]
             score = self.extract_score(content)
             return score, content.strip()
+        except requests.exceptions.RequestException as e:
+            return None, self._format_requests_error("Anthropic Claude", e)
         except Exception as e:
-            return None, f"API error: {e}"
+            return None, f"Anthropic Claude unexpected error: {self._sanitize_error_text(str(e))}"
 
 
 class OpenRouterProvider(AIProvider):
@@ -438,8 +537,10 @@ class OpenRouterProvider(AIProvider):
             content = result["choices"][0]["message"]["content"]
             score = self.extract_score(content)
             return score, content.strip()
+        except requests.exceptions.RequestException as e:
+            return None, self._format_requests_error("OpenRouter", e)
         except Exception as e:
-            return None, f"OpenRouter API error: {e}"
+            return None, f"OpenRouter unexpected error: {self._sanitize_error_text(str(e))}"
 
 
 # Provider registry

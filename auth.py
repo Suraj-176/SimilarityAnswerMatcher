@@ -1,6 +1,7 @@
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -11,12 +12,58 @@ import streamlit as st
 
 USERS_DB_PATH = os.path.join(os.getcwd(), ".users.json")
 AUTH_SESSIONS_DB_PATH = os.path.join(os.getcwd(), ".auth_sessions.json")
+APP_LOG_PATH = os.path.join(os.getcwd(), "application.log")
+ERROR_LOG_PATH = os.path.join(os.getcwd(), "error_log.txt")
 PASSWORD_MIN_LENGTH = 8
 SYSTEM_ADMIN_USERNAME = "admin"
 SYSTEM_ADMIN_PASSWORD = "System@123"
 SESSION_IDLE_TIMEOUT_SECONDS = int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "1800"))
 TEMP_PASSWORD_PREFIX = "Temp"
 TEMP_PASSWORD_SPECIALS = "@#$%&*!"
+
+
+def _configure_application_logging():
+    root_logger = logging.getLogger()
+    if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
+        root_logger.setLevel(logging.INFO)
+
+    abs_log_path = os.path.abspath(APP_LOG_PATH)
+    has_handler = any(
+        isinstance(handler, logging.FileHandler)
+        and os.path.abspath(getattr(handler, "baseFilename", "")) == abs_log_path
+        for handler in root_logger.handlers
+    )
+    if has_handler:
+        return
+
+    try:
+        file_handler = logging.FileHandler(APP_LOG_PATH, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        )
+        root_logger.addHandler(file_handler)
+    except Exception:
+        # Keep app functional even if logging file setup fails.
+        pass
+
+
+def _read_text_file(path: str, max_chars: int | None = None) -> str:
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        if max_chars is not None and max_chars > 0 and len(text) > max_chars:
+            return text[-max_chars:]
+        return text
+    except Exception as exc:
+        logging.getLogger(__name__).error("Failed reading file '%s': %s", path, exc)
+        return ""
+
+
+_configure_application_logging()
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -67,6 +114,8 @@ class AuthManager:
             st.session_state.show_user_main_menu = False
         if "show_user_profile_panel" not in st.session_state:
             st.session_state.show_user_profile_panel = False
+        if "show_user_menu_logs" not in st.session_state:
+            st.session_state.show_user_menu_logs = False
         if "profile_menu_open" not in st.session_state:
             st.session_state.profile_menu_open = False
         if "user_theme" not in st.session_state:
@@ -406,11 +455,13 @@ class AuthManager:
         if not user_entry:
             st.session_state.login_attempts += 1
             st.session_state.last_attempt_time = time.time()
+            logger.warning("Login failed: unknown username '%s'.", lookup)
             return False, "Invalid credentials"
 
         if not self.verify_password(password or "", user_entry.get("password_hash", ""), user_entry.get("salt", "")):
             st.session_state.login_attempts += 1
             st.session_state.last_attempt_time = time.time()
+            logger.warning("Login failed: invalid password for username '%s'.", lookup)
             return False, "Invalid credentials"
 
         st.session_state.authenticated = True
@@ -425,6 +476,7 @@ class AuthManager:
         st.session_state.session_start_time = now
         st.session_state.last_activity_time = now
         self._create_persistent_session(lookup, user_entry)
+        logger.info("Login successful for user '%s'.", lookup)
         return True, st.session_state.user_role
 
     def register_user(
@@ -482,6 +534,7 @@ class AuthManager:
         if not self._save_user_store(store):
             return False, "Could not save user. Please try again."
 
+        logger.info("User registered successfully: '%s'.", username_key)
         return True, "Sign up successful. Please login with your new credentials."
 
     def issue_temporary_password(self, identifier: str) -> tuple[bool, str, str]:
@@ -519,6 +572,7 @@ class AuthManager:
         if not self._save_user_store(store):
             return False, "", "Password reset failed while saving."
 
+        logger.info("Temporary password issued for user '%s'.", target_key)
         return True, temp_password, "Temporary password generated."
 
     def _generate_temporary_password(self, current_hash: str = "", current_salt: str = "") -> str:
@@ -568,6 +622,7 @@ class AuthManager:
             return False, "Could not save new password."
 
         st.session_state.password_reset_required = False
+        logger.info("Password changed for user '%s'.", user_key)
         return True, "Password updated successfully."
 
     def set_user_theme(self, theme: str) -> tuple[bool, str]:
@@ -927,6 +982,7 @@ class AuthManager:
             return False, "Could not delete user."
         self._remove_user_settings(user_key)
         self._remove_user_sessions(user_key)
+        logger.info("User profile deleted for user '%s'.", user_key)
         return True, "User deleted successfully."
 
     def _render_auth_css(self):
@@ -1222,6 +1278,7 @@ class AuthManager:
         return True
 
     def logout(self, rerun: bool = True):
+        active_user = (st.session_state.get("user_key") or st.session_state.get("username") or "").strip().lower()
         self._clear_persistent_session()
         st.session_state.authenticated = False
         st.session_state.user_role = None
@@ -1235,6 +1292,7 @@ class AuthManager:
         st.session_state.show_forgot_password = False
         st.session_state.show_user_menu_change_password = False
         st.session_state.show_user_menu_delete_confirm = False
+        st.session_state.show_user_menu_logs = False
         st.session_state.show_user_main_menu = False
         st.session_state.show_user_profile_panel = False
         st.session_state.profile_menu_open = False
@@ -1264,6 +1322,9 @@ class AuthManager:
             if key.endswith(transient_suffixes):
                 del st.session_state[key]
 
+        if active_user:
+            logger.info("Logout completed for user '%s'.", active_user)
+
         if rerun:
             st.rerun()
 
@@ -1272,6 +1333,13 @@ class AuthManager:
 def get_current_user_key() -> str:
     raw = st.session_state.get("user_key") or st.session_state.get("username") or "default"
     return str(raw).strip().lower() or "default"
+
+
+def _clear_profile_dialog_flags():
+    st.session_state.show_user_menu_change_password = False
+    st.session_state.show_user_menu_delete_confirm = False
+    st.session_state.show_user_menu_logs = False
+    st.session_state.profile_menu_open = False
 
 
 def check_authentication() -> bool:
@@ -1309,6 +1377,9 @@ def check_authentication() -> bool:
             current_saved_theme = (st.session_state.get("user_theme") or "light").strip().lower()
             if pending_theme != current_saved_theme:
                 auth_manager.set_user_theme(pending_theme)
+                # Closing any previously-opened profile dialogs avoids stale dialog
+                # state reopening on reruns triggered by theme switch.
+                _clear_profile_dialog_flags()
 
         if not auth_manager.check_session_timeout():
             return False
@@ -1333,6 +1404,8 @@ def show_user_info():
         st.session_state.show_user_menu_change_password = False
     if "show_user_menu_delete_confirm" not in st.session_state:
         st.session_state.show_user_menu_delete_confirm = False
+    if "show_user_menu_logs" not in st.session_state:
+        st.session_state.show_user_menu_logs = False
     if "profile_menu_open" not in st.session_state:
         st.session_state.profile_menu_open = False
     if "user_theme" not in st.session_state:
@@ -1483,9 +1556,11 @@ def show_user_info():
             color: #ffffff !important;
         }}
         .st-key-profile_btn_change button,
+        .st-key-profile_btn_logs button,
         .st-key-profile_btn_delete button,
         .st-key-profile_btn_logout button,
         [class*="st-key-profile_btn_change"] button,
+        [class*="st-key-profile_btn_logs"] button,
         [class*="st-key-profile_btn_delete"] button,
         [class*="st-key-profile_btn_logout"] button {{
             width: 100% !important;
@@ -1502,9 +1577,11 @@ def show_user_info():
             font-size: 0.98rem !important;
         }}
         .st-key-profile_btn_change button p,
+        .st-key-profile_btn_logs button p,
         .st-key-profile_btn_delete button p,
         .st-key-profile_btn_logout button p,
         [class*="st-key-profile_btn_change"] button p,
+        [class*="st-key-profile_btn_logs"] button p,
         [class*="st-key-profile_btn_delete"] button p,
         [class*="st-key-profile_btn_logout"] button p {{
             color: {panel_text} !important;
@@ -1512,6 +1589,7 @@ def show_user_info():
             margin: 0 !important;
         }}
         .st-key-profile_btn_change button:hover p,
+        .st-key-profile_btn_logs button:hover p,
         .st-key-profile_btn_delete button:hover p,
         .st-key-profile_btn_logout button:hover p {{
             color: #38bdf8 !important;
@@ -1575,11 +1653,18 @@ def show_user_info():
                 st.markdown("<div class='st-key-profile_menu_separator'><hr></div>", unsafe_allow_html=True)
                 if st.button("Change Password", key="profile_btn_change", type="tertiary"):
                     st.session_state.show_user_menu_change_password = True
+                    st.session_state.show_user_menu_logs = False
+                    st.session_state.show_user_menu_delete_confirm = False
+                if st.button("Application Logs", key="profile_btn_logs", type="tertiary"):
+                    st.session_state.show_user_menu_logs = True
+                    st.session_state.show_user_menu_change_password = False
                     st.session_state.show_user_menu_delete_confirm = False
                 if st.button("Delete Profile", key="profile_btn_delete", type="tertiary"):
                     st.session_state.show_user_menu_delete_confirm = True
                     st.session_state.show_user_menu_change_password = False
+                    st.session_state.show_user_menu_logs = False
                 if st.button("Logout", key="profile_btn_logout", type="tertiary"):
+                    st.session_state.show_user_menu_logs = False
                     auth_mgr.logout()
         else:
             # Fallback for older Streamlit versions without st.popover.
@@ -1595,15 +1680,85 @@ def show_user_info():
                 )
                 if st.button("Change Password", key="profile_btn_change_fb", type="tertiary"):
                     st.session_state.show_user_menu_change_password = True
+                    st.session_state.show_user_menu_logs = False
+                    st.session_state.show_user_menu_delete_confirm = False
+                    st.session_state.profile_menu_open = False
+                if st.button("Application Logs", key="profile_btn_logs_fb", type="tertiary"):
+                    st.session_state.show_user_menu_logs = True
+                    st.session_state.show_user_menu_change_password = False
                     st.session_state.show_user_menu_delete_confirm = False
                     st.session_state.profile_menu_open = False
                 if st.button("Delete Profile", key="profile_btn_delete_fb", type="tertiary"):
                     st.session_state.show_user_menu_delete_confirm = True
                     st.session_state.show_user_menu_change_password = False
+                    st.session_state.show_user_menu_logs = False
                     st.session_state.profile_menu_open = False
                 if st.button("Logout", key="profile_btn_logout_fb", type="tertiary"):
                     st.session_state.profile_menu_open = False
+                    st.session_state.show_user_menu_logs = False
                     auth_mgr.logout()
+
+    if st.session_state.get("show_user_menu_logs", False):
+        @st.dialog("Application Logs")
+        def _application_logs_dialog():
+            st.caption("Latest entries are shown below. You can download each full log file.")
+
+            app_preview = _read_text_file(APP_LOG_PATH, max_chars=20000)
+            err_preview = _read_text_file(ERROR_LOG_PATH, max_chars=20000)
+            app_full = _read_text_file(APP_LOG_PATH)
+            err_full = _read_text_file(ERROR_LOG_PATH)
+
+            app_tab, err_tab = st.tabs(["application.log", "error_log.txt"])
+
+            with app_tab:
+                st.download_button(
+                    "Download application.log",
+                    data=app_full.encode("utf-8"),
+                    file_name="application.log",
+                    mime="text/plain",
+                    key="download_application_log_btn",
+                    use_container_width=True,
+                    disabled=not bool(app_full),
+                )
+                if app_preview:
+                    st.caption(f"Showing latest {len(app_preview):,} characters")
+                    st.text_area(
+                        "application.log preview",
+                        value=app_preview,
+                        height=360,
+                        key="application_log_preview_area",
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.info("`application.log` is empty.")
+
+            with err_tab:
+                st.download_button(
+                    "Download error_log.txt",
+                    data=err_full.encode("utf-8"),
+                    file_name="error_log.txt",
+                    mime="text/plain",
+                    key="download_error_log_btn",
+                    use_container_width=True,
+                    disabled=not bool(err_full),
+                )
+                if err_preview:
+                    st.caption(f"Showing latest {len(err_preview):,} characters")
+                    st.text_area(
+                        "error_log.txt preview",
+                        value=err_preview,
+                        height=360,
+                        key="error_log_preview_area",
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.info("`error_log.txt` is empty.")
+
+            if st.button("Close", key="close_application_logs_dialog", use_container_width=True):
+                st.session_state.show_user_menu_logs = False
+                st.rerun()
+
+        _application_logs_dialog()
 
     if st.session_state.get("show_user_menu_change_password", False):
         @st.dialog("Change Password")
@@ -1621,6 +1776,7 @@ def show_user_info():
                 if cancel_click:
                     st.session_state.show_user_menu_change_password = False
                     st.session_state.show_user_menu_delete_confirm = False
+                    st.session_state.show_user_menu_logs = False
                     st.session_state.profile_menu_open = False
                     st.rerun()
 
@@ -1630,6 +1786,7 @@ def show_user_info():
                         st.session_state.auth_feedback = {"level": "success", "text": msg}
                         st.session_state.show_user_menu_change_password = False
                         st.session_state.show_user_menu_delete_confirm = False
+                        st.session_state.show_user_menu_logs = False
                         st.session_state.profile_menu_open = False
                         st.rerun()
                     st.error(msg)
@@ -1648,6 +1805,7 @@ def show_user_info():
                         st.session_state.auth_feedback = {"level": "success", "text": msg}
                         st.session_state.show_user_menu_delete_confirm = False
                         st.session_state.show_user_menu_change_password = False
+                        st.session_state.show_user_menu_logs = False
                         st.session_state.profile_menu_open = False
                         auth_mgr.logout()
                     else:
@@ -1656,6 +1814,7 @@ def show_user_info():
                 if st.button("Cancel", key="dialog_cancel_delete_user", use_container_width=True):
                     st.session_state.show_user_menu_delete_confirm = False
                     st.session_state.show_user_menu_change_password = False
+                    st.session_state.show_user_menu_logs = False
                     st.session_state.profile_menu_open = False
                     st.rerun()
 

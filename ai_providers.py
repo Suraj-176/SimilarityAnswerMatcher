@@ -43,29 +43,60 @@ class AIProvider(ABC):
         """Extract numerical score from response."""
         try:
             content_str = str(content).strip()
+            content_str = re.sub(r"```(?:json|text)?", " ", content_str, flags=re.IGNORECASE)
+            content_str = content_str.replace("```", " ").strip()
             logger.debug("Extracting score from: %s", content_str[:100])
 
-            # First preference: explicit percentages like "87%" or "87.5%".
-            pct_matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", content_str)
-            for token in reversed(pct_matches):
-                score = float(token)
-                if 0 <= score <= 100:
-                    logger.debug("Extracted percent score: %s", score)
-                    return score
-
-            # Fallback: plain numbers.
-            # Use the last valid number, because models often include context before final answer.
-            num_matches = re.findall(r"-?\d+(?:\.\d+)?", content_str)
-            for token in reversed(num_matches):
-                score = float(token)
+            def coerce_score(token: str):
+                try:
+                    score = float(str(token).strip())
+                except Exception:
+                    return None
                 if score < 0:
-                    continue
-                # Many models return a ratio in [0, 1]. Convert to percentage.
-                if 0 <= score <= 1 and "." in token:
+                    return None
+                if 0 <= score <= 1 and "." in str(token):
                     converted = round(score * 100, 2)
                     logger.debug("Extracted ratio score %s -> %s%%", score, converted)
                     return converted
                 if 0 <= score <= 100:
+                    return score
+                return None
+
+            keyed_patterns = [
+                r'"(?:similarity_score|similarity|score)"\s*:\s*(-?\d+(?:\.\d+)?)',
+                r"\b(?:similarity score|similarity|score)\s*(?:is|=|:)\s*(-?\d+(?:\.\d+)?)\b",
+                r"\b(-?\d+(?:\.\d+)?)\s*(?:out of|/)\s*100\b",
+            ]
+            for pattern in keyed_patterns:
+                matches = re.findall(pattern, content_str, flags=re.IGNORECASE)
+                for token in reversed(matches):
+                    score = coerce_score(token)
+                    if score is not None:
+                        logger.debug("Extracted keyed score: %s", score)
+                        return score
+
+            # First preference: explicit percentages like "87%" or "87.5%".
+            pct_matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", content_str)
+            for token in reversed(pct_matches):
+                score = coerce_score(token)
+                if score is not None:
+                    logger.debug("Extracted percent score: %s", score)
+                    return score
+
+            # Prefer a lone number if the whole response is essentially numeric.
+            stripped = content_str.strip().strip('"').strip("'")
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", stripped):
+                score = coerce_score(stripped)
+                if score is not None:
+                    logger.debug("Extracted standalone numeric score: %s", score)
+                    return score
+
+            # Fallback: plain numbers.
+            # Use the last valid number, because models often include context before the final answer.
+            num_matches = re.findall(r"-?\d+(?:\.\d+)?", content_str)
+            for token in reversed(num_matches):
+                score = coerce_score(token)
+                if score is not None:
                     logger.debug("Extracted numeric score: %s", score)
                     return score
 

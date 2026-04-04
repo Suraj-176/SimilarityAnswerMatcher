@@ -30,13 +30,45 @@ if not check_authentication():
 show_user_info()
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant, Provided the similarity score by comparing text 1 and"
-    " text 2, just provide only similarity score without explaination"
+    "You are a similarity scoring engine for answer matching. Compare semantic meaning "
+    "and final answer equivalence, not formatting. Ignore casing, punctuation, filler "
+    "phrases such as 'based on the provided context', and minor wording changes. Return "
+    "only one numeric score from 0 to 100."
 )
 DEFAULT_USER_PROMPT_TEMPLATE = (
-    "Compare the following two texts and provide a similarity score as a percentage."
-    " Text 1: {answer1} Text 2: {answer2}"
+    "Compare these two answers and score their semantic similarity from 0 to 100.\n"
+    "Give a high score when they mean the same thing even if the wording is different.\n"
+    "Return only the numeric score.\n"
+    "Answer 1:\n{answer1}\n\n"
+    "Answer 2:\n{answer2}"
 )
+
+SIMILARITY_CONTEXT_PHRASES = (
+    r"based on the provided context",
+    r"from the context",
+    r"from context",
+    r"context",
+    r"see context",
+    r"as per context",
+    r"per context",
+    r"per the context",
+    r"per the provided context",
+    r"provided context",
+    r"according to",
+)
+
+SIMILARITY_NEGATION_TOKENS = {
+    "no",
+    "not",
+    "never",
+    "none",
+    "cannot",
+    "without",
+    "false",
+    "incorrect",
+    "neither",
+    "nor",
+}
 
 
 def _normalized_prompt_value(prompt_value, fallback):
@@ -46,11 +78,16 @@ def _normalized_prompt_value(prompt_value, fallback):
     return fallback
 
 
-def _normalize_similarity_text(text):
+def _normalize_similarity_text(text, relax_numbers=False):
     text = str(text or "").lower().strip()
     if not text:
         return ""
+    text = re.sub(r"\[.*?\]", " ", text)
+    for phrase in SIMILARITY_CONTEXT_PHRASES:
+        text = re.sub(rf"\b{phrase}\b", " ", text)
     text = re.sub(r"[^\w\s]", " ", text)
+    if relax_numbers:
+        text = re.sub(r"\d+(?:\.\d+)?", " <num> ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -73,10 +110,10 @@ def _counter_cosine_similarity(c1, c2):
     return dot / (n1 * n2)
 
 
-def _lexical_similarity_percent(text1, text2):
+def _lexical_similarity_percent_core(text1, text2, relax_numbers=False):
     """Hybrid lexical similarity fallback (0-100) with better quality than raw ratio."""
-    a = _normalize_similarity_text(text1)
-    b = _normalize_similarity_text(text2)
+    a = _normalize_similarity_text(text1, relax_numbers=relax_numbers)
+    b = _normalize_similarity_text(text2, relax_numbers=relax_numbers)
     if not a or not b:
         return 0.0
 
@@ -111,6 +148,106 @@ def _lexical_similarity_percent(text1, text2):
         + 0.05 * num_score
     )
     return round(max(0.0, min(1.0, score)) * 100.0, 2)
+
+
+def _lexical_similarity_percent(text1, text2):
+    strict_score = _lexical_similarity_percent_core(text1, text2, relax_numbers=False)
+    relaxed_score = _lexical_similarity_percent_core(text1, text2, relax_numbers=True)
+    if relaxed_score <= strict_score:
+        return strict_score
+
+    strict_a = _normalize_similarity_text(text1)
+    strict_b = _normalize_similarity_text(text2)
+    nums_a = set(re.findall(r"\d+(?:\.\d+)?", strict_a))
+    nums_b = set(re.findall(r"\d+(?:\.\d+)?", strict_b))
+
+    if not nums_a and not nums_b:
+        return strict_score
+
+    boost_cap = 10.0 if nums_a and nums_b and not (nums_a & nums_b) else 14.0
+    return round(min(relaxed_score, strict_score + boost_cap), 2)
+
+
+def _has_negation_mismatch(text1, text2):
+    a_tokens = set(_normalize_similarity_text(text1).split())
+    b_tokens = set(_normalize_similarity_text(text2).split())
+    a_has_negation = bool(a_tokens & SIMILARITY_NEGATION_TOKENS)
+    b_has_negation = bool(b_tokens & SIMILARITY_NEGATION_TOKENS)
+    return a_has_negation != b_has_negation
+
+
+def _calibrate_similarity_score(score, text1, text2):
+    if score is None:
+        return None
+    try:
+        score_val = float(score)
+    except Exception:
+        return None
+
+    score_val = max(0.0, min(100.0, score_val))
+    strict_a = _normalize_similarity_text(text1)
+    strict_b = _normalize_similarity_text(text2)
+    if not strict_a or not strict_b:
+        return round(score_val, 2)
+    if strict_a == strict_b:
+        return 100.0
+
+    relaxed_a = _normalize_similarity_text(text1, relax_numbers=True)
+    relaxed_b = _normalize_similarity_text(text2, relax_numbers=True)
+    strict_score = _lexical_similarity_percent_core(text1, text2, relax_numbers=False)
+    anchor_score = _lexical_similarity_percent(text1, text2)
+    nums_a = set(re.findall(r"\d+(?:\.\d+)?", strict_a))
+    nums_b = set(re.findall(r"\d+(?:\.\d+)?", strict_b))
+    has_disjoint_numbers = bool(nums_a and nums_b and not (nums_a & nums_b))
+    negation_mismatch = _has_negation_mismatch(text1, text2)
+    adjusted = score_val
+
+    if not negation_mismatch and relaxed_a == relaxed_b and strict_a != strict_b:
+        adjusted = max(adjusted, 78.0 if has_disjoint_numbers else 86.0)
+    elif not negation_mismatch:
+        if anchor_score >= 90.0 and adjusted < 78.0:
+            adjusted = max(adjusted, round((adjusted * 0.60) + (anchor_score * 0.40), 2))
+        elif anchor_score >= 82.0 and adjusted < 70.0:
+            adjusted = max(adjusted, round((adjusted * 0.70) + (anchor_score * 0.30), 2))
+        elif anchor_score >= 74.0 and (anchor_score - adjusted) >= 18.0:
+            adjusted = max(adjusted, round((adjusted * 0.80) + (anchor_score * 0.20), 2))
+
+    if negation_mismatch and adjusted > strict_score + 8.0:
+        adjusted = strict_score + 8.0
+
+    return round(max(0.0, min(100.0, adjusted)), 2)
+
+
+def _calibrate_similarity_series(scores, left_texts, right_texts):
+    calibrated = []
+    for score, lhs, rhs in zip(scores, left_texts, right_texts):
+        calibrated.append(_calibrate_similarity_score(score, lhs, rhs))
+    return calibrated
+
+
+def _build_similarity_system_prompt(system_prompt):
+    base_prompt = _normalized_prompt_value(system_prompt, DEFAULT_SYSTEM_PROMPT).strip()
+    guidance = (
+        "Focus on semantic meaning and final answer equivalence. Ignore punctuation, casing, "
+        "boilerplate/context phrases, and minor rewording. Return only a single numeric score "
+        "from 0 to 100 with no explanation."
+    )
+    if guidance.lower() in base_prompt.lower():
+        return base_prompt
+    return f"{base_prompt}\n\n{guidance}".strip()
+
+
+def _build_similarity_user_template(user_template):
+    prompt_template = _normalized_prompt_value(user_template, DEFAULT_USER_PROMPT_TEMPLATE)
+    if "{answer1}" not in prompt_template or "{answer2}" not in prompt_template:
+        prompt_template = DEFAULT_USER_PROMPT_TEMPLATE
+    output_rule = (
+        "\n\nScoring rules: compare semantic meaning, ignore filler phrases and formatting, "
+        "and output only one number from 0 to 100."
+    )
+    if "output only one number" in prompt_template.lower() or "return only the numeric score" in prompt_template.lower():
+        return prompt_template
+    return f"{prompt_template.rstrip()}{output_rule}"
 
 
 def _get_available_local_models():
@@ -2183,8 +2320,8 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
     from ai_providers import get_provider
 
     # Pass a template string; providers perform the final format(answer1, answer2).
-    prompt_template = _normalized_prompt_value(user_template, DEFAULT_USER_PROMPT_TEMPLATE)
-    sys_content = _normalized_prompt_value(system_prompt, DEFAULT_SYSTEM_PROMPT)
+    prompt_template = _build_similarity_user_template(user_template)
+    sys_content = _build_similarity_system_prompt(system_prompt)
     safe_max_tokens = max(16, int(max_tokens or 20))
 
     try:
@@ -2519,6 +2656,8 @@ if compare_clicked:
                             raw_sim = [None] * min_len
                             fuzzy_scores = [None] * min_len
 
+                    final_percent_sim = _calibrate_similarity_series(final_percent_sim, answers1, answers2)
+
                     match_quality = [
                         "High" if s and s > threshold else ("Medium" if s and s > 60 else "Low")
                         for s in final_percent_sim
@@ -2844,6 +2983,9 @@ if compare_clicked:
                                 raw_sim_a = [None] * min_len
                                 raw_sim_b = [None] * min_len
 
+                        final_percent_sim_a = _calibrate_similarity_series(final_percent_sim_a, base_vals, target_a_vals)
+                        final_percent_sim_b = _calibrate_similarity_series(final_percent_sim_b, base_vals, target_b_vals)
+
                         match_quality_a = ["High" if s and s > threshold else ("Medium" if s and s > 60 else "Low") for s in final_percent_sim_a]
                         match_quality_b = ["High" if s and s > threshold else ("Medium" if s and s > 60 else "Low") for s in final_percent_sim_b]
 
@@ -3105,6 +3247,8 @@ if compare_clicked:
                                 final_percent_sim = [None] * min_len
                                 raw_sim = [None] * min_len
                                 fuzzy_scores = [None] * min_len
+
+                        final_percent_sim = _calibrate_similarity_series(final_percent_sim, answers1, answers2)
 
                         match_quality = [
                             "High" if s and s > threshold else ("Medium" if s and s > 60 else "Low")

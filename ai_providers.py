@@ -32,6 +32,7 @@ class AIProvider(ABC):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         """
         Get similarity score between two texts.
@@ -192,6 +193,7 @@ class AzureOpenAIProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         deployment_name = (model_name or "gpt-4o").strip() or "gpt-4o"
         url = (
@@ -203,7 +205,7 @@ class AzureOpenAIProvider(AIProvider):
             "api-key": self.api_key,
         }
 
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -242,13 +244,14 @@ class OpenAIGPT4oProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "model": model_name or self.MODEL_NAME,
             "messages": [
@@ -291,6 +294,7 @@ class GroqProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
@@ -298,7 +302,7 @@ class GroqProvider(AIProvider):
             "Content-Type": "application/json",
         }
 
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "model": model_name or "mixtral-8x7b-32768",
             "messages": [
@@ -373,12 +377,13 @@ class GeminiProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         gemini_model = (model_name or "gemini-pro").strip() or "gemini-pro"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         headers = {"Content-Type": "application/json"}
 
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         full_prompt = f"{system_prompt}\n\n{prompt}"
 
         data = {
@@ -455,6 +460,7 @@ class GrokProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         url = "https://api.x.ai/v1/chat/completions"
         headers = {
@@ -462,7 +468,7 @@ class GrokProvider(AIProvider):
             "Content-Type": "application/json",
         }
 
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "model": model_name or "grok-beta",
             "messages": [
@@ -500,6 +506,7 @@ class ClaudeProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         url = "https://api.anthropic.com/v1/messages"
         headers = {
@@ -508,7 +515,7 @@ class ClaudeProvider(AIProvider):
             "content-type": "application/json",
         }
 
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "model": model_name or "claude-3-opus-20240229",
             "max_tokens": int(max_tokens),
@@ -544,13 +551,14 @@ class OpenRouterProvider(AIProvider):
         top_p: float = 1.0,
         max_tokens: int = 20,
         model_name: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        prompt = user_template.format(answer1=answer1, answer2=answer2)
+        prompt = user_template.format(answer1=answer1, answer2=answer2, question=(question or ""))
         data = {
             "model": model_name or "openai/gpt-4o-mini",
             "messages": [

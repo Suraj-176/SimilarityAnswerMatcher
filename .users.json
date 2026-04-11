@@ -12,10 +12,10 @@
       "must_change_password": false,
       "temporary_password_active": false,
       "created_at": "2026-02-14T18:51:35Z",
-      "updated_at": "2026-02-15T09:17:08Z",
+      "updated_at": "2026-04-04T15:03:36Z",
       "allow_password_reset": false,
       "system_account": true,
-      "theme": "dark"
+      "theme": "light"
     },
     "suraj": {
       "username": "Suraj",

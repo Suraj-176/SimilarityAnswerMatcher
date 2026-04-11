@@ -4,6 +4,7 @@ import numpy as np
 import io
 import os
 import json
+import html
 import logging
 import subprocess
 import threading
@@ -13,6 +14,8 @@ import difflib
 import re
 import sys
 import traceback
+import zipfile
+import xml.etree.ElementTree as ET
 from collections import Counter
 
 from openpyxl.utils import get_column_letter
@@ -32,12 +35,21 @@ show_user_info()
 DEFAULT_SYSTEM_PROMPT = (
     "You are a similarity scoring engine for answer matching. Compare semantic meaning "
     "and final answer equivalence, not formatting. Ignore casing, punctuation, filler "
-    "phrases such as 'based on the provided context', and minor wording changes. Return "
-    "only one numeric score from 0 to 100."
+    "phrases such as 'based on the provided context', and minor wording changes. Use the "
+    "question to judge whether both answers address the same thing. If both answers "
+    "honestly indicate the context does not provide the requested information, score them "
+    "high. If one answer abstains but the other gives concrete content, score them lower. "
+    "If one answer is more cautious about missing details but the shared facts still align, "
+    "treat that as a moderate-to-high match rather than a contradiction. "
+    "Return only one numeric score from 0 to 100."
 )
 DEFAULT_USER_PROMPT_TEMPLATE = (
-    "Compare these two answers and score their semantic similarity from 0 to 100.\n"
+    "Question:\n{question}\n\n"
+    "Compare these two answers to the same question and score their semantic similarity from 0 to 100.\n"
     "Give a high score when they mean the same thing even if the wording is different.\n"
+    "If both answers correctly say the context does not provide the information, give a high score.\n"
+    "If one answer abstains while the other gives a concrete answer, lower the score.\n"
+    "If one answer says some details are not stated but both answers still share the same available facts, score it as a moderate-to-high match instead of a low mismatch.\n"
     "Return only the numeric score.\n"
     "Answer 1:\n{answer1}\n\n"
     "Answer 2:\n{answer2}"
@@ -57,6 +69,23 @@ SIMILARITY_CONTEXT_PHRASES = (
     r"according to",
 )
 
+SIMILARITY_ABSTENTION_PATTERNS = (
+    r"\bnot (?:explicitly )?(?:stated|described|provided|mentioned|available|included)\b",
+    r"\bnot (?:fully )?(?:explained|detailed|defined|clarified)\b",
+    r"\bnot explicitly (?:detailed|explained|defined|clarified)\b",
+    r"\bnot described in detail\b",
+    r"\bdoes not (?:explicitly )?(?:state|describe|provide|mention|specify|cover|include)\b",
+    r"\bdoes not (?:fully )?(?:explain|detail|clarify|define)\b",
+    r"\bnot enough information\b",
+    r"\binsufficient information\b",
+    r"\bno (?:specific )?(?:information|details?) (?:are|is) (?:provided|available)\b",
+    r"\bthe provided context does not\b",
+    r"\bthe context does not\b",
+    r"\bthe provided context only (?:indicates|states|mentions|shows)\b",
+    r"\bthe context only (?:indicates|states|mentions|shows)\b",
+    r"\bnot available in the provided context\b",
+)
+
 SIMILARITY_NEGATION_TOKENS = {
     "no",
     "not",
@@ -69,6 +98,176 @@ SIMILARITY_NEGATION_TOKENS = {
     "neither",
     "nor",
 }
+
+SIMILARITY_TRUE_TOKENS = {
+    "yes",
+    "true",
+    "approved",
+    "allow",
+    "allowed",
+    "enable",
+    "enabled",
+    "success",
+    "successful",
+    "present",
+}
+
+SIMILARITY_FALSE_TOKENS = {
+    "no",
+    "false",
+    "denied",
+    "disallowed",
+    "disable",
+    "disabled",
+    "fail",
+    "failed",
+    "absent",
+}
+
+SIMILARITY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "to",
+    "was",
+    "were",
+    "will",
+    "with",
+}
+
+SIMILARITY_MONTH_TOKENS = {
+    "jan",
+    "january",
+    "feb",
+    "february",
+    "mar",
+    "march",
+    "apr",
+    "april",
+    "may",
+    "jun",
+    "june",
+    "jul",
+    "july",
+    "aug",
+    "august",
+    "sep",
+    "sept",
+    "september",
+    "oct",
+    "october",
+    "nov",
+    "november",
+    "dec",
+    "december",
+}
+
+SIMILARITY_UNIT_SPECS = {
+    "mg": ("mass", 0.001),
+    "milligram": ("mass", 0.001),
+    "milligrams": ("mass", 0.001),
+    "g": ("mass", 1.0),
+    "gram": ("mass", 1.0),
+    "grams": ("mass", 1.0),
+    "kg": ("mass", 1000.0),
+    "kgs": ("mass", 1000.0),
+    "kilogram": ("mass", 1000.0),
+    "kilograms": ("mass", 1000.0),
+    "lb": ("mass", 453.59237),
+    "lbs": ("mass", 453.59237),
+    "pound": ("mass", 453.59237),
+    "pounds": ("mass", 453.59237),
+    "oz": ("mass", 28.349523125),
+    "ounce": ("mass", 28.349523125),
+    "ounces": ("mass", 28.349523125),
+    "mm": ("length", 0.001),
+    "millimeter": ("length", 0.001),
+    "millimeters": ("length", 0.001),
+    "cm": ("length", 0.01),
+    "centimeter": ("length", 0.01),
+    "centimeters": ("length", 0.01),
+    "m": ("length", 1.0),
+    "meter": ("length", 1.0),
+    "meters": ("length", 1.0),
+    "km": ("length", 1000.0),
+    "kilometer": ("length", 1000.0),
+    "kilometers": ("length", 1000.0),
+    "in": ("length", 0.0254),
+    "inch": ("length", 0.0254),
+    "inches": ("length", 0.0254),
+    "ft": ("length", 0.3048),
+    "foot": ("length", 0.3048),
+    "feet": ("length", 0.3048),
+    "yd": ("length", 0.9144),
+    "yard": ("length", 0.9144),
+    "yards": ("length", 0.9144),
+    "mi": ("length", 1609.344),
+    "mile": ("length", 1609.344),
+    "miles": ("length", 1609.344),
+    "ml": ("volume", 0.001),
+    "milliliter": ("volume", 0.001),
+    "milliliters": ("volume", 0.001),
+    "millilitre": ("volume", 0.001),
+    "millilitres": ("volume", 0.001),
+    "l": ("volume", 1.0),
+    "liter": ("volume", 1.0),
+    "liters": ("volume", 1.0),
+    "litre": ("volume", 1.0),
+    "litres": ("volume", 1.0),
+    "gal": ("volume", 3.785411784),
+    "gallon": ("volume", 3.785411784),
+    "gallons": ("volume", 3.785411784),
+    "ms": ("duration", 0.001),
+    "millisecond": ("duration", 0.001),
+    "milliseconds": ("duration", 0.001),
+    "sec": ("duration", 1.0),
+    "secs": ("duration", 1.0),
+    "second": ("duration", 1.0),
+    "seconds": ("duration", 1.0),
+    "min": ("duration", 60.0),
+    "mins": ("duration", 60.0),
+    "minute": ("duration", 60.0),
+    "minutes": ("duration", 60.0),
+    "hr": ("duration", 3600.0),
+    "hrs": ("duration", 3600.0),
+    "hour": ("duration", 3600.0),
+    "hours": ("duration", 3600.0),
+    "kb": ("storage", 1024.0),
+    "mb": ("storage", 1024.0 * 1024.0),
+    "gb": ("storage", 1024.0 * 1024.0 * 1024.0),
+    "tb": ("storage", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    "byte": ("storage", 1.0),
+    "bytes": ("storage", 1.0),
+}
+
+SIMILARITY_UNIT_PATTERN = re.compile(
+    r"(?<!\w)(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>"
+    + "|".join(sorted((re.escape(unit) for unit in SIMILARITY_UNIT_SPECS.keys()), key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
 
 
 def _normalized_prompt_value(prompt_value, fallback):
@@ -90,6 +289,35 @@ def _normalize_similarity_text(text, relax_numbers=False):
         text = re.sub(r"\d+(?:\.\d+)?", " <num> ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _strip_similarity_markup(text):
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\[(?:\d+(?:\s*,\s*\d+)*)\]", " ", cleaned)
+    cleaned = re.sub(r"\[(?:\d+)\]\[(?:\d+)\]", " ", cleaned)
+    cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", cleaned)
+    cleaned = cleaned.replace("**", " ").replace("__", " ").replace("`", " ")
+    cleaned = re.sub(r"(?m)^\s*[-*+]\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\d+\.\s+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _prepare_answer_for_similarity(text):
+    return _strip_similarity_markup(text)
+
+
+def _prepare_question_for_similarity(text):
+    return _strip_similarity_markup(text)
+
+
+def _has_abstention_signal(text):
+    source = _prepare_answer_for_similarity(text).lower()
+    if not source:
+        return False
+    return any(re.search(pattern, source, flags=re.IGNORECASE) for pattern in SIMILARITY_ABSTENTION_PATTERNS)
 
 
 def _char_ngrams(text, n=3):
@@ -169,11 +397,162 @@ def _lexical_similarity_percent(text1, text2):
 
 
 def _has_negation_mismatch(text1, text2):
+    if _has_abstention_signal(text1) or _has_abstention_signal(text2):
+        return False
     a_tokens = set(_normalize_similarity_text(text1).split())
     b_tokens = set(_normalize_similarity_text(text2).split())
     a_has_negation = bool(a_tokens & SIMILARITY_NEGATION_TOKENS)
     b_has_negation = bool(b_tokens & SIMILARITY_NEGATION_TOKENS)
     return a_has_negation != b_has_negation
+
+
+def _extract_numeric_tokens(text):
+    return set(re.findall(r"\d+(?:\.\d+)?", _normalize_similarity_text(text)))
+
+
+def _extract_percent_tokens(text):
+    source = str(text or "").lower()
+    return set(re.findall(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", source))
+
+
+def _extract_date_markers(text):
+    normalized = _normalize_similarity_text(text)
+    markers = set(re.findall(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", str(text or "").lower()))
+    markers.update(re.findall(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", str(text or "").lower()))
+    markers.update(token for token in normalized.split() if token in SIMILARITY_MONTH_TOKENS)
+    return markers
+
+
+def _extract_boolean_label(text):
+    tokens = set(_normalize_similarity_text(text).split())
+    has_true = bool(tokens & SIMILARITY_TRUE_TOKENS)
+    has_false = bool(tokens & SIMILARITY_FALSE_TOKENS)
+    if has_true and not has_false:
+        return "true"
+    if has_false and not has_true:
+        return "false"
+    return None
+
+
+def _extract_quantity_units(text):
+    quantities = []
+    source = str(text or "").lower()
+    for match in SIMILARITY_UNIT_PATTERN.finditer(source):
+        raw_value = match.group("value")
+        unit = match.group("unit").lower()
+        spec = SIMILARITY_UNIT_SPECS.get(unit)
+        if not spec:
+            continue
+        category, factor = spec
+        try:
+            numeric_value = float(raw_value)
+        except Exception:
+            continue
+        quantities.append(
+            {
+                "raw_value": raw_value,
+                "category": category,
+                "unit": unit,
+                "normalized": numeric_value * factor,
+            }
+        )
+    return quantities
+
+
+def _quantities_close(value_a, value_b):
+    scale = max(1.0, abs(value_a), abs(value_b))
+    return abs(value_a - value_b) <= (scale * 0.02)
+
+
+def _analyze_quantity_unit_relationships(text1, text2):
+    quantities_a = _extract_quantity_units(text1)
+    quantities_b = _extract_quantity_units(text2)
+    categories_a = {item["category"] for item in quantities_a}
+    categories_b = {item["category"] for item in quantities_b}
+    shared_categories = categories_a & categories_b
+    matched_numeric_tokens_a = set()
+    matched_numeric_tokens_b = set()
+    unit_mismatch = False
+
+    for category in shared_categories:
+        cat_items_a = [item for item in quantities_a if item["category"] == category]
+        cat_items_b = [item for item in quantities_b if item["category"] == category]
+        matched_in_category = False
+        for item_a in cat_items_a:
+            for item_b in cat_items_b:
+                if _quantities_close(item_a["normalized"], item_b["normalized"]):
+                    matched_in_category = True
+                    matched_numeric_tokens_a.add(item_a["raw_value"])
+                    matched_numeric_tokens_b.add(item_b["raw_value"])
+        if not matched_in_category:
+            unit_mismatch = True
+
+    return {
+        "matched_numeric_tokens_a": matched_numeric_tokens_a,
+        "matched_numeric_tokens_b": matched_numeric_tokens_b,
+        "unit_mismatch": unit_mismatch,
+    }
+
+
+def _significant_tokens(text):
+    tokens = []
+    for token in _normalize_similarity_text(text, relax_numbers=True).split():
+        if token == "<num>":
+            tokens.append(token)
+            continue
+        if token in SIMILARITY_STOPWORDS:
+            continue
+        if len(token) <= 2:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def _significant_overlap_ratio(text1, text2):
+    tokens_a = set(_significant_tokens(text1))
+    tokens_b = set(_significant_tokens(text2))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / max(1, min(len(tokens_a), len(tokens_b)))
+
+
+def _is_short_subset_match(text1, text2):
+    tokens_a = set(_significant_tokens(text1))
+    tokens_b = set(_significant_tokens(text2))
+    if not tokens_a or not tokens_b:
+        return False
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if len(shorter) > 3:
+        return False
+    return shorter.issubset(longer)
+
+
+def _detect_similarity_conflicts(text1, text2):
+    numeric_a = _extract_numeric_tokens(text1)
+    numeric_b = _extract_numeric_tokens(text2)
+    percent_a = _extract_percent_tokens(text1)
+    percent_b = _extract_percent_tokens(text2)
+    date_a = _extract_date_markers(text1)
+    date_b = _extract_date_markers(text2)
+    bool_a = _extract_boolean_label(text1)
+    bool_b = _extract_boolean_label(text2)
+    abstain_a = _has_abstention_signal(text1)
+    abstain_b = _has_abstention_signal(text2)
+    quantity_relationships = _analyze_quantity_unit_relationships(text1, text2)
+    residual_numeric_a = numeric_a - quantity_relationships["matched_numeric_tokens_a"]
+    residual_numeric_b = numeric_b - quantity_relationships["matched_numeric_tokens_b"]
+    month_style_date_mismatch = bool(date_a and date_b and numeric_a and numeric_b and numeric_a != numeric_b)
+
+    return {
+        "negation_mismatch": _has_negation_mismatch(text1, text2),
+        "boolean_mismatch": bool(bool_a and bool_b and bool_a != bool_b),
+        "numeric_mismatch": bool(residual_numeric_a and residual_numeric_b and not (residual_numeric_a & residual_numeric_b)),
+        "percent_mismatch": bool(percent_a and percent_b and not (percent_a & percent_b)),
+        "date_mismatch": bool((date_a and date_b and not (date_a & date_b)) or month_style_date_mismatch),
+        "unit_mismatch": quantity_relationships["unit_mismatch"],
+        "abstention_mismatch": bool(abstain_a != abstain_b),
+        "both_abstain": bool(abstain_a and abstain_b),
+    }
 
 
 def _calibrate_similarity_score(score, text1, text2):
@@ -199,7 +578,19 @@ def _calibrate_similarity_score(score, text1, text2):
     nums_a = set(re.findall(r"\d+(?:\.\d+)?", strict_a))
     nums_b = set(re.findall(r"\d+(?:\.\d+)?", strict_b))
     has_disjoint_numbers = bool(nums_a and nums_b and not (nums_a & nums_b))
-    negation_mismatch = _has_negation_mismatch(text1, text2)
+    overlap_ratio = _significant_overlap_ratio(text1, text2)
+    short_subset_match = _is_short_subset_match(text1, text2)
+    conflicts = _detect_similarity_conflicts(text1, text2)
+    negation_mismatch = conflicts["negation_mismatch"]
+    hard_value_conflict = any(
+        conflicts[key]
+        for key in ("boolean_mismatch", "percent_mismatch", "date_mismatch", "unit_mismatch", "numeric_mismatch")
+    )
+    shared_fact_abstention = (
+        conflicts["abstention_mismatch"]
+        and not hard_value_conflict
+        and overlap_ratio >= 0.5
+    )
     adjusted = score_val
 
     if not negation_mismatch and relaxed_a == relaxed_b and strict_a != strict_b:
@@ -212,8 +603,60 @@ def _calibrate_similarity_score(score, text1, text2):
         elif anchor_score >= 74.0 and (anchor_score - adjusted) >= 18.0:
             adjusted = max(adjusted, round((adjusted * 0.80) + (anchor_score * 0.20), 2))
 
-    if negation_mismatch and adjusted > strict_score + 8.0:
-        adjusted = strict_score + 8.0
+    # Hard contradiction caps prevent wording overlap from producing false 90+ matches.
+    if conflicts["boolean_mismatch"]:
+        adjusted = min(adjusted, 52.0)
+    if conflicts["percent_mismatch"]:
+        adjusted = min(adjusted, 58.0)
+    if conflicts["date_mismatch"]:
+        adjusted = min(adjusted, 60.0)
+    if conflicts["unit_mismatch"]:
+        adjusted = min(adjusted, 60.0 if overlap_ratio >= 0.6 else 68.0)
+    if conflicts["numeric_mismatch"]:
+        adjusted = min(adjusted, 68.0 if overlap_ratio >= 0.6 else 75.0)
+    if conflicts["abstention_mismatch"]:
+        if shared_fact_abstention and (anchor_score >= 32.0 or score_val >= 72.0):
+            adjusted = min(adjusted, 80.0 if overlap_ratio >= 0.65 else 76.0)
+            if score_val >= 72.0:
+                adjusted = max(adjusted, 72.0)
+        elif overlap_ratio >= 0.6 or anchor_score >= 48.0:
+            adjusted = min(adjusted, 74.0)
+        elif overlap_ratio >= 0.45 or anchor_score >= 34.0:
+            adjusted = min(adjusted, 68.0)
+        else:
+            adjusted = min(adjusted, 62.0)
+    if negation_mismatch:
+        adjusted = min(adjusted, strict_score + 6.0, 62.0)
+    if conflicts["both_abstain"] and not has_disjoint_numbers and not hard_value_conflict:
+        adjusted = max(adjusted, 88.0 if anchor_score >= 50.0 else 82.0)
+
+    # Partial-answer risk: one answer is much longer, with limited shared content.
+    sig_a = _significant_tokens(text1)
+    sig_b = _significant_tokens(text2)
+    length_ratio = (max(len(sig_a), len(sig_b)) / max(1, min(len(sig_a), len(sig_b)))) if sig_a and sig_b else 1.0
+    if (
+        adjusted > 84.0
+        and not short_subset_match
+        and overlap_ratio < 0.5
+        and length_ratio >= 1.8
+        and anchor_score < 88.0
+    ):
+        adjusted = min(adjusted, 84.0)
+
+    # Balanced high-score gate: allow 90+ only for strong semantic agreement with no conflicts.
+    has_conflict = any(conflicts.values())
+    allow_ninety_plus = (
+        not has_conflict
+        and (
+            strict_a == strict_b
+            or (relaxed_a == relaxed_b and not has_disjoint_numbers)
+            or (short_subset_match and score_val >= 88.0 and overlap_ratio >= 0.5)
+            or (score_val >= 92.0 and anchor_score >= 84.0 and overlap_ratio >= 0.5)
+            or (score_val >= 95.0 and anchor_score >= 80.0 and overlap_ratio >= 0.4)
+        )
+    )
+    if adjusted > 90.0 and not allow_ninety_plus:
+        adjusted = min(adjusted, 89.0)
 
     return round(max(0.0, min(100.0, adjusted)), 2)
 
@@ -228,9 +671,13 @@ def _calibrate_similarity_series(scores, left_texts, right_texts):
 def _build_similarity_system_prompt(system_prompt):
     base_prompt = _normalized_prompt_value(system_prompt, DEFAULT_SYSTEM_PROMPT).strip()
     guidance = (
-        "Focus on semantic meaning and final answer equivalence. Ignore punctuation, casing, "
-        "boilerplate/context phrases, and minor rewording. Return only a single numeric score "
-        "from 0 to 100 with no explanation."
+        "Focus on semantic meaning and final answer equivalence. Use the question to judge "
+        "whether both answers respond to the same requirement. Ignore punctuation, casing, "
+        "boilerplate/context phrases, citation markers, and minor rewording. If both answers "
+        "correctly indicate the source does not provide the requested information, treat them "
+        "as a strong match. If one answer is more cautious about missing detail but the shared "
+        "facts still align, keep the score in a moderate-to-high range rather than treating it "
+        "like a contradiction. Return only a single numeric score from 0 to 100 with no explanation."
     )
     if guidance.lower() in base_prompt.lower():
         return base_prompt
@@ -241,9 +688,13 @@ def _build_similarity_user_template(user_template):
     prompt_template = _normalized_prompt_value(user_template, DEFAULT_USER_PROMPT_TEMPLATE)
     if "{answer1}" not in prompt_template or "{answer2}" not in prompt_template:
         prompt_template = DEFAULT_USER_PROMPT_TEMPLATE
+    if "{question}" not in prompt_template:
+        prompt_template = f"Question:\n{{question}}\n\n{prompt_template.lstrip()}"
     output_rule = (
-        "\n\nScoring rules: compare semantic meaning, ignore filler phrases and formatting, "
-        "and output only one number from 0 to 100."
+        "\n\nScoring rules: compare semantic meaning, use the question as context, ignore filler "
+        "phrases/citation markers/formatting, treat matching abstentions as a strong match, keep "
+        "partial abstention with aligned facts in a moderate-to-high band, and "
+        "output only one number from 0 to 100."
     )
     if "output only one number" in prompt_template.lower() or "return only the numeric score" in prompt_template.lower():
         return prompt_template
@@ -276,60 +727,536 @@ def _has_sentence_transformers() -> bool:
         return False
 
 
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+TEXT_FILE_EXTENSIONS = {".txt", ".md", ".log"}
+JSON_FILE_EXTENSIONS = {".json"}
+PDF_FILE_EXTENSIONS = {".pdf"}
+WORD_FILE_EXTENSIONS = {".docx"}
+LEGACY_WORD_FILE_EXTENSIONS = {".doc"}
+COMPARE_ANY_TWO_EXTENSIONS = (
+    SPREADSHEET_EXTENSIONS
+    | TEXT_FILE_EXTENSIONS
+    | JSON_FILE_EXTENSIONS
+    | PDF_FILE_EXTENSIONS
+    | WORD_FILE_EXTENSIONS
+)
+
+
+def _uploaded_file_extension(uploaded_file):
+    if uploaded_file is None:
+        return ""
+    name = getattr(uploaded_file, "name", "") or ""
+    return os.path.splitext(name.lower())[1]
+
+
+def _is_spreadsheet_upload(uploaded_file):
+    return _uploaded_file_extension(uploaded_file) in SPREADSHEET_EXTENSIONS
+
+
+def _read_csv_with_encodings(uploaded_file):
+    last_exc = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding=enc, sep=None, engine="python")
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is None:
+        raise RuntimeError("Failed to read CSV: unknown error")
+    raise last_exc
+
+
+def _read_excel_upload(uploaded_file, sheet_name=None):
+    uploaded_file.seek(0)
+    xl = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+    if isinstance(xl, dict):
+        if not xl:
+            raise ValueError("Excel file does not contain any readable sheets.")
+        if sheet_name is None:
+            return next(iter(xl.values()))
+        if sheet_name in xl:
+            return xl[sheet_name]
+        str_key = str(sheet_name)
+        if str_key in xl:
+            return xl[str_key]
+        return next(iter(xl.values()))
+    return xl
+
+
+def _decode_uploaded_text(uploaded_file):
+    last_exc = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
+        try:
+            uploaded_file.seek(0)
+            raw = uploaded_file.read()
+            if isinstance(raw, str):
+                return raw
+            return raw.decode(enc)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is None:
+        raise RuntimeError("File content could not be decoded as text.")
+    raise last_exc
+
+
+def _build_segment_dataframe(segments, label_prefix):
+    clean_segments = [re.sub(r"\s+", " ", str(segment)).strip() for segment in segments if str(segment).strip()]
+    if not clean_segments:
+        raise ValueError("The uploaded file did not contain readable text to compare.")
+    return pd.DataFrame(
+        {
+            "Section": [f"{label_prefix} {idx + 1}" for idx in range(len(clean_segments))],
+            "Content": clean_segments,
+        }
+    )
+
+
+def _split_text_segments(text):
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return [], "Section"
+
+    paragraphs = [
+        re.sub(r"\s+", " ", chunk).strip()
+        for chunk in re.split(r"\n\s*\n+", normalized)
+        if chunk.strip()
+    ]
+    if len(paragraphs) >= 2:
+        return paragraphs, "Paragraph"
+
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    if lines:
+        return lines, "Line"
+
+    return [normalized], "Section"
+
+
+def _stringify_nested_value(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _normalize_structured_dataframe(df, index_label="Row"):
+    normalized_df = df.copy()
+    normalized_df.columns = [
+        str(col).strip() if str(col).strip() else f"Column {idx + 1}"
+        for idx, col in enumerate(normalized_df.columns)
+    ]
+    for col in normalized_df.columns:
+        normalized_df[col] = normalized_df[col].apply(_stringify_nested_value)
+
+    if normalized_df.shape[1] == 0:
+        raise ValueError("The uploaded file did not contain any comparable data.")
+
+    if normalized_df.shape[1] == 1:
+        only_col = normalized_df.columns[0]
+        normalized_df.insert(0, index_label, [f"{index_label} {idx + 1}" for idx in range(len(normalized_df))])
+        if only_col == index_label:
+            normalized_df = normalized_df.rename(columns={only_col: "Value"})
+
+    return normalized_df
+
+
+def _flatten_json_pairs(value, prefix="root"):
+    if isinstance(value, dict):
+        rows = []
+        if not value:
+            return [(prefix, "")]
+        for key, item in value.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            rows.extend(_flatten_json_pairs(item, next_prefix))
+        return rows
+
+    if isinstance(value, list):
+        rows = []
+        if not value:
+            return [(prefix, "[]")]
+        for idx, item in enumerate(value):
+            next_prefix = f"{prefix}[{idx}]"
+            rows.extend(_flatten_json_pairs(item, next_prefix))
+        return rows
+
+    return [(prefix, _stringify_nested_value(value))]
+
+
+def _find_json_record_list(value):
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        return value
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _find_json_record_list(item)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _find_json_record_list(item)
+            if found:
+                return found
+    return None
+
+
+def _build_json_upload_dataframe(uploaded_file):
+    uploaded_file.seek(0)
+    payload = json.loads(_decode_uploaded_text(uploaded_file))
+
+    record_list = _find_json_record_list(payload)
+    if record_list:
+        return _normalize_structured_dataframe(pd.DataFrame(record_list))
+
+    if isinstance(payload, dict):
+        rows = _flatten_json_pairs(payload)
+        return pd.DataFrame(rows, columns=["Field", "Value"])
+
+    if isinstance(payload, list):
+        if all(not isinstance(item, (dict, list)) for item in payload):
+            return pd.DataFrame(
+                {
+                    "Item": [f"Item {idx + 1}" for idx in range(len(payload))],
+                    "Value": [_stringify_nested_value(item) for item in payload],
+                }
+            )
+        rows = _flatten_json_pairs(payload)
+        return pd.DataFrame(rows, columns=["Field", "Value"])
+
+    return pd.DataFrame({"Item": ["Item 1"], "Value": [_stringify_nested_value(payload)]})
+
+
+def _build_text_upload_dataframe(uploaded_file):
+    text = _decode_uploaded_text(uploaded_file)
+    segments, label_prefix = _split_text_segments(text)
+    return _build_segment_dataframe(segments, label_prefix)
+
+
+def _build_docx_upload_dataframe(uploaded_file):
+    uploaded_file.seek(0)
+    try:
+        with zipfile.ZipFile(uploaded_file) as archive:
+            xml_payload = archive.read("word/document.xml")
+    except KeyError as exc:
+        raise ValueError("DOCX file does not contain a readable document body.") from exc
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded DOCX file is invalid or corrupted.") from exc
+
+    root = ET.fromstring(xml_payload)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs = []
+    for paragraph in root.findall(".//w:body/w:p", namespace):
+        text_parts = [node.text for node in paragraph.findall(".//w:t", namespace) if node.text]
+        paragraph_text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
+        if paragraph_text:
+            paragraphs.append(paragraph_text)
+
+    return _build_segment_dataframe(paragraphs, "Paragraph")
+
+
+def _extract_pdf_text_pages(file_bytes):
+    reader_errors = []
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        return [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:
+        reader_errors.append(exc)
+
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        return [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:
+        reader_errors.append(exc)
+
+    raise RuntimeError(
+        "PDF text extraction requires 'pypdf' or 'PyPDF2' in the app environment."
+    ) from (reader_errors[-1] if reader_errors else None)
+
+
+def _build_pdf_upload_dataframe(uploaded_file):
+    uploaded_file.seek(0)
+    file_bytes = uploaded_file.read()
+    pages = _extract_pdf_text_pages(file_bytes)
+    clean_pages = [page for page in pages if page and page.strip()]
+    if not clean_pages:
+        raise ValueError(
+            "The PDF appears to be scanned or image-only, so no selectable text could be extracted. "
+            "Please run OCR on the PDF or convert it to DOCX/TXT and retry."
+        )
+    return _build_segment_dataframe(clean_pages, "Page")
+
+
+def _default_compare_columns(df):
+    if df is None or not hasattr(df, "columns") or len(df.columns) == 0:
+        raise ValueError("No comparable columns are available.")
+    question_col = df.columns[0]
+    answer_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    return question_col, answer_col
+
+
+def _should_use_best_match_alignment(comparison_mode, uploaded_file1, uploaded_file2):
+    if comparison_mode != "Compare Any Two Files":
+        return False
+    return (
+        (uploaded_file1 is not None and not _is_spreadsheet_upload(uploaded_file1))
+        or (uploaded_file2 is not None and not _is_spreadsheet_upload(uploaded_file2))
+    )
+
+
+def _should_use_question_context(comparison_mode, uploaded_file1=None, uploaded_file2=None):
+    if comparison_mode == "Compare Two Columns in Same Excel File":
+        return True
+    if comparison_mode == "Compare Two Excel Files":
+        return True
+    if comparison_mode == "Compare Any Two Files":
+        return bool(
+            uploaded_file1 is not None
+            and uploaded_file2 is not None
+            and _is_spreadsheet_upload(uploaded_file1)
+            and _is_spreadsheet_upload(uploaded_file2)
+        )
+    return False
+
+
+def _alignment_seed_score(text1, text2):
+    left = str(text1 or "").strip()
+    right = str(text2 or "").strip()
+    if not left and not right:
+        return 0.0
+    if not left or not right:
+        return -1.0
+
+    lexical_score = _lexical_similarity_percent(left, right)
+    overlap_score = _significant_overlap_ratio(left, right) * 100.0
+    seed_score = (0.85 * lexical_score) + (0.15 * overlap_score)
+
+    relaxed_left = _normalize_similarity_text(left, relax_numbers=True)
+    relaxed_right = _normalize_similarity_text(right, relax_numbers=True)
+    if relaxed_left and relaxed_left == relaxed_right:
+        seed_score += 10.0
+    elif _is_short_subset_match(left, right):
+        seed_score += 6.0
+
+    return round(max(0.0, min(100.0, seed_score)), 2)
+
+
+def _build_best_match_alignment(question_labels1, answers1, question_labels2, answers2):
+    questions1 = [str(value or "") for value in (question_labels1 or [])]
+    answers1 = [str(value or "") for value in (answers1 or [])]
+    questions2 = [str(value or "") for value in (question_labels2 or [])]
+    answers2 = [str(value or "") for value in (answers2 or [])]
+
+    candidate_pairs = []
+    for left_index, left_answer in enumerate(answers1):
+        for right_index, right_answer in enumerate(answers2):
+            seed_score = _alignment_seed_score(left_answer, right_answer)
+            candidate_pairs.append((seed_score, left_index, right_index))
+
+    candidate_pairs.sort(
+        key=lambda item: (item[0], -abs(item[1] - item[2]), -item[1], -item[2]),
+        reverse=True,
+    )
+
+    left_to_right = {}
+    used_left = set()
+    used_right = set()
+
+    for seed_score, left_index, right_index in candidate_pairs:
+        if left_index in used_left or right_index in used_right:
+            continue
+        left_to_right[left_index] = (right_index, seed_score)
+        used_left.add(left_index)
+        used_right.add(right_index)
+        if len(used_left) == min(len(answers1), len(answers2)):
+            break
+
+    aligned_rows = []
+    for left_index in range(len(answers1)):
+        if left_index in left_to_right:
+            right_index, seed_score = left_to_right[left_index]
+            aligned_rows.append(
+                {
+                    "question1": questions1[left_index],
+                    "answer1": answers1[left_index],
+                    "question2": questions2[right_index],
+                    "answer2": answers2[right_index],
+                    "alignment_seed_score": seed_score,
+                }
+            )
+        else:
+            aligned_rows.append(
+                {
+                    "question1": questions1[left_index],
+                    "answer1": answers1[left_index],
+                    "question2": "",
+                    "answer2": "",
+                    "alignment_seed_score": None,
+                }
+            )
+
+    for right_index in range(len(answers2)):
+        if right_index in used_right:
+            continue
+        aligned_rows.append(
+            {
+                "question1": "",
+                "answer1": "",
+                "question2": questions2[right_index],
+                "answer2": answers2[right_index],
+                "alignment_seed_score": None,
+            }
+        )
+
+    return aligned_rows
+
+
 def read_uploaded_file(uploaded_file, sheet_name=None):
-    """Read a Streamlit uploaded file which may be CSV or Excel.
-    - If filename ends with .csv, try reading as CSV with several common encodings and delimiter auto-detection.
-    - Otherwise try Excel first, then fall back to CSV with encoding fallbacks.
-    Returns a pandas.DataFrame or raises the last caught exception.
-    """
+    """Read spreadsheet and non-spreadsheet uploads into a comparable DataFrame."""
     if uploaded_file is None:
         return None
 
-    fname = getattr(uploaded_file, "name", "").lower()
+    extension = _uploaded_file_extension(uploaded_file)
 
-    # Helper to attempt CSV read with multiple encodings and auto delimiter detection
-    def try_read_csv_with_encodings(fileobj):
-        last_exc = None
-        for enc in ("utf-8", "cp1252", "latin1"):
-            try:
-                fileobj.seek(0)
-                # sep=None + engine='python' lets pandas sniff the delimiter
-                return pd.read_csv(fileobj, encoding=enc, sep=None, engine='python')
-            except Exception as e:
-                last_exc = e
-                continue
-        # re-raise last exception (ensure we raise an Exception instance)
-        if last_exc is None:
-            raise RuntimeError("Failed to read CSV: unknown error")
-        raise last_exc
+    if extension == ".csv":
+        return _read_csv_with_encodings(uploaded_file)
 
-    # If file extension clearly indicates CSV, try CSV first
-    if fname.endswith('.csv'):
-        return try_read_csv_with_encodings(uploaded_file)
+    if extension in {".xlsx", ".xls"}:
+        return _read_excel_upload(uploaded_file, sheet_name=sheet_name)
 
-    # Otherwise try Excel first (honoring sheet_name), then fall back to CSV attempts
+    if extension in JSON_FILE_EXTENSIONS:
+        return _build_json_upload_dataframe(uploaded_file)
+
+    if extension in TEXT_FILE_EXTENSIONS:
+        return _build_text_upload_dataframe(uploaded_file)
+
+    if extension in WORD_FILE_EXTENSIONS:
+        return _build_docx_upload_dataframe(uploaded_file)
+
+    if extension in PDF_FILE_EXTENSIONS:
+        return _build_pdf_upload_dataframe(uploaded_file)
+
+    if extension in LEGACY_WORD_FILE_EXTENSIONS:
+        raise ValueError("Legacy .doc files are not supported directly. Save the file as .docx, .txt, or .pdf and retry.")
+
     try:
-        uploaded_file.seek(0)
-        xl = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
-        # pandas returns a dict when sheet_name=None (all sheets). Choose a sensible default.
-        if isinstance(xl, dict):
-            if sheet_name is None:
-                # return the first sheet's DataFrame
-                first_df = next(iter(xl.values()))
-                return first_df
-            # If a specific sheet name/index was requested, attempt to retrieve it
-            if sheet_name in xl:
-                return xl[sheet_name]
-            # try string key coercion
-            str_key = str(sheet_name)
-            if str_key in xl:
-                return xl[str_key]
-            # fallback to first sheet
-            return next(iter(xl.values()))
-        return xl
-    except Exception:
-        # If Excel failed, try CSV with common encodings
-        return try_read_csv_with_encodings(uploaded_file)
+        return _read_excel_upload(uploaded_file, sheet_name=sheet_name)
+    except Exception as excel_exc:
+        try:
+            return _read_csv_with_encodings(uploaded_file)
+        except Exception:
+            raise ValueError(
+                f"Unsupported or unreadable file type '{extension or 'unknown'}'. "
+                "Use Excel/CSV, JSON, TXT, PDF, or DOCX."
+            ) from excel_exc
+
+
+def _build_export_summary(df, threshold, primary_sim_col=None):
+    if df is None or df.empty:
+        return {
+            "total_pairs": 0,
+            "above_threshold": 0,
+            "between_40_threshold": 0,
+            "below_40": 0,
+            "average_similarity": 0,
+            "threshold": threshold,
+        }
+
+    sim_col = primary_sim_col if primary_sim_col in df.columns else None
+    if sim_col is None:
+        sim_cols = [c for c in df.columns if "Similarity" in str(c)]
+        sim_col = sim_cols[0] if sim_cols else None
+
+    if sim_col and sim_col in df.columns:
+        numeric_sim = pd.to_numeric(df[sim_col], errors="coerce")
+        total_pairs = int(numeric_sim.notna().sum())
+        above_thresh = int((numeric_sim >= threshold).sum())
+        between_40_thresh = int(((numeric_sim >= 40) & (numeric_sim < threshold)).sum())
+        below_40 = int((numeric_sim < 40).sum())
+        avg_similarity = round(float(numeric_sim.mean()), 2) if total_pairs > 0 else 0
+    else:
+        total_pairs = len(df)
+        above_thresh = 0
+        between_40_thresh = 0
+        below_40 = 0
+        avg_similarity = 0
+
+    return {
+        "total_pairs": total_pairs,
+        "above_threshold": above_thresh,
+        "between_40_threshold": between_40_thresh,
+        "below_40": below_40,
+        "average_similarity": avg_similarity,
+        "threshold": threshold,
+    }
+
+
+def _build_non_excel_export_df(df):
+    export_df = df.copy()
+    drop_cols = [c for c in export_df.columns if "(diff)" in str(c)]
+    if drop_cols:
+        export_df = export_df.drop(columns=drop_cols, errors="ignore")
+
+    for col in export_df.columns:
+        if "Similarity" in str(col):
+            numeric = pd.to_numeric(export_df[col], errors="coerce")
+            export_df[col] = numeric.apply(lambda v: f"{float(v):.2f}%" if pd.notnull(v) else "")
+    return export_df
+
+
+def _build_non_excel_json_payload(df, summary, uploaded_file1=None, uploaded_file2=None):
+    payload = {
+        "export_type": "similarity_results",
+        "input_files": [
+            getattr(uploaded_file1, "name", "") if uploaded_file1 is not None else "",
+            getattr(uploaded_file2, "name", "") if uploaded_file2 is not None else "",
+        ],
+        "summary": summary,
+        "rows": json.loads(df.to_json(orient="records", force_ascii=False)),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _build_non_excel_html_payload(df, summary, title):
+    safe_title = html.escape(title)
+    table_html = df.to_html(index=False, escape=True)
+    summary_rows = [
+        ("Total Pairs", summary["total_pairs"]),
+        (f"Above {summary['threshold']}%", summary["above_threshold"]),
+        (f"Between 40-{summary['threshold']}%", summary["between_40_threshold"]),
+        ("Below 40%", summary["below_40"]),
+        ("Average Similarity (%)", summary["average_similarity"]),
+    ]
+    summary_items = "".join(
+        f"<li><strong>{html.escape(str(label))}:</strong> {html.escape(str(value))}</li>"
+        for label, value in summary_rows
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{safe_title}</title>
+  <style>
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 24px; color: #0f172a; background: #f8fafc; }}
+    h1 {{ margin-bottom: 8px; }}
+    .summary {{ background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; }}
+    .summary ul {{ margin: 0; padding-left: 20px; }}
+    table {{ width: 100%; border-collapse: collapse; background: #ffffff; }}
+    th, td {{ border: 1px solid #dbe4ee; padding: 10px 12px; text-align: left; vertical-align: top; }}
+    th {{ background: #e2e8f0; }}
+    tr:nth-child(even) td {{ background: #f8fafc; }}
+  </style>
+</head>
+<body>
+  <h1>{safe_title}</h1>
+  <div class="summary">
+    <ul>{summary_items}</ul>
+  </div>
+  {table_html}
+</body>
+</html>"""
 
 
 
@@ -1121,7 +2048,7 @@ st.session_state['comparison_mode'] = comparison_mode
 # Dynamic description
 desc = {
     "Compare Two Excel Files": "Upload two Excel files with questions in the first column and answers in the second column.",
-    "Compare Any Two Files": "Upload any two files (CSV, JSON, TXT, PDF, DOC/DOCX). Select columns to compare answers.",
+    "Compare Any Two Files": "Upload any two files (JSON, TXT, PDF, DOCX, or structured sheets). Select columns to compare answers.",
     "Compare Two Columns in Same Excel File": "Upload a single Excel file with at least three columns: one for questions and two for answers.",
     "Compare One Column with Two Targets (Same Excel)": "Upload a single Excel file: one base column compared separately with two target columns."
 }
@@ -1228,7 +2155,6 @@ provider_aliases = {
     "Grok": "xAI Grok",
     "Claude 3 Opus": "Anthropic Claude",
     "OpenAI GPT-4o-mini": "OpenAI GPT-4o-mini",
-    "__local_disabled__": "Local Model",
 }
 
 matching_display_map = {
@@ -1239,14 +2165,13 @@ matching_display_map = {
     "xAI Grok": "xAI Grok",
     "Google Gemini": "Google Gemini",
     "Anthropic Claude": "Anthropic Claude",
-    "Local Model": "Local Model",
 }
 
 params = st.query_params
 if 'matching' in params and params.get('matching'):
     val = provider_aliases.get(params.get('matching')[0], params.get('matching')[0])
     from ai_providers import PROVIDERS
-    if val in PROVIDERS or val == "Local Model":
+    if val in PROVIDERS:
         # Only set from URL if session state has no value yet (don't override user actions)
         if 'matching_method' not in st.session_state:
             st.session_state['matching_method'] = val
@@ -1310,6 +2235,11 @@ if 'matching_method' not in st.session_state:
 matching_method = st.session_state.get('matching_method', 'Azure OpenAI GPT-4o')
 selected_model = None
 local_backend_ready = _has_sentence_transformers()
+
+if matching_method == "Local Model":
+    matching_method = "Azure OpenAI GPT-4o"
+    st.session_state['matching_method'] = matching_method
+    st.session_state['matching_method_select'] = matching_method
 
 if matching_method == "Local Model":
     with api_col_main:
@@ -1607,7 +2537,7 @@ if st.session_state.get('show_advanced_gpt', False):
             height=64,
             key="gpt_user_template",
             label_visibility="collapsed",
-            help="Template for the user message. Use {answer1} and {answer2} as placeholders. Applies to all providers."
+            help="Template for the user message. Use {question}, {answer1}, and {answer2} as placeholders. Applies to all providers."
         )
 
     # (Save/Reset buttons moved next to Max Tokens input for visibility)
@@ -2046,15 +2976,23 @@ col1_a_val = None
 col2_q_val = None
 col2_a_val = None
 
-# File upload logic - "Compare Any Two Files" supports all file types, others only Excel/CSV
+# File upload logic - "Compare Any Two Files" supports spreadsheet + document/text formats
 if IS_TWO_FILE_MODE:
     col1, col2 = st.columns(2)
     if comparison_mode == "Compare Any Two Files":
-        # Support non-Excel file types for the "Compare Any Two Files" option
+        supported_compare_any_types = [ext.lstrip(".") for ext in sorted(COMPARE_ANY_TWO_EXTENSIONS)]
         with col1:
-            uploaded_file1 = st.file_uploader("Upload First File (CSV / JSON / TXT / PDF / DOC)", key="file1")
+            uploaded_file1 = st.file_uploader(
+                "Upload First File (JSON / TXT / PDF / DOCX)",
+                type=supported_compare_any_types,
+                key="file1",
+            )
         with col2:
-            uploaded_file2 = st.file_uploader("Upload Second File (CSV / JSON / TXT / PDF / DOC)", key="file2")
+            uploaded_file2 = st.file_uploader(
+                "Upload Second File (JSON / TXT / PDF / DOCX)",
+                type=supported_compare_any_types,
+                key="file2",
+            )
     else:
         # Excel-specific modes only support Excel and CSV
         with col1:
@@ -2077,7 +3015,7 @@ if uploaded_file1:
         try:
             fn1 = getattr(uploaded_file1, 'name', '') or ''
             if fn1.lower().endswith(('.xlsx', '.xls')):
-                xls1 = pd.ExcelFile(uploaded_file1, engine='openpyxl')
+                xls1 = pd.ExcelFile(uploaded_file1)
                 sheets = xls1.sheet_names
             else:
                 sheets = []
@@ -2102,7 +3040,10 @@ if uploaded_file1:
             allow_excel_files = comparison_mode != "Compare Any Two Files"
             df1 = read_uploaded_file(uploaded_file1)
             if df1 is None or not hasattr(df1, 'columns'):
-                st.error("Uploaded file could not be read. Please upload a valid Excel or CSV file.")
+                if comparison_mode == "Compare Any Two Files":
+                    st.error("Uploaded file could not be read. Please upload a valid Excel/CSV, JSON, TXT, PDF, or DOCX file.")
+                else:
+                    st.error("Uploaded file could not be read. Please upload a valid Excel or CSV file.")
                 df1 = pd.DataFrame()
                 skip_file_read = True
             else:
@@ -2110,67 +3051,90 @@ if uploaded_file1:
 
         if IS_TWO_FILE_MODE:
             allow_excel_files = comparison_mode != "Compare Any Two Files"
-            # detect sheets for file2 as well
-            sheets2 = []
-            try:
-                fn2 = getattr(uploaded_file2, 'name', '') or ''
-                if fn2.lower().endswith(('.xlsx', '.xls')):
-                    xls2 = pd.ExcelFile(uploaded_file2, engine='openpyxl')
-                    sheets2 = xls2.sheet_names
-            except Exception:
-                sheets2 = []
-
-            # If either file has multiple sheets, allow per-file sheet selection laid out side-by-side
-            if sheets or sheets2:
-                sheet_col1, sheet_col2 = st.columns(2)
-                with sheet_col1:
-                    if sheets:
-                        sel1 = st.selectbox("Select sheet for File 1", sheets, index=0, key="file1_sheet_select")
-                    else:
-                        sel1 = None
-                with sheet_col2:
-                    if sheets2:
-                        sel2 = st.selectbox("Select sheet for File 2", sheets2, index=0, key="file2_sheet_select")
-                    else:
-                        sel2 = None
-            else:
-                sel1 = sel2 = None
-
-            # Re-read the files using chosen sheets (if any)
-            df1 = read_uploaded_file(uploaded_file1, sheet_name=sel1 if sel1 else None)
-            df2 = read_uploaded_file(uploaded_file2, sheet_name=sel2 if sel2 else None)
-
-            # Validate read results
-            if df1 is None or not hasattr(df1, 'columns'):
-                st.error("Could not read File 1. Please check the file and re-upload.")
-                df1 = pd.DataFrame()
-                skip_file_read = True
-            if df2 is None or not hasattr(df2, 'columns'):
-                st.error("Could not read File 2. Please check the file and re-upload.")
+            if uploaded_file2 is None:
+                st.info("Upload the second file to continue with two-file comparison.")
                 df2 = pd.DataFrame()
                 skip_file_read = True
+            else:
+            # detect sheets for file2 as well
+                sheets2 = []
+                try:
+                    fn2 = getattr(uploaded_file2, 'name', '') or ''
+                    if fn2.lower().endswith(('.xlsx', '.xls')):
+                        xls2 = pd.ExcelFile(uploaded_file2)
+                        sheets2 = xls2.sheet_names
+                except Exception:
+                    sheets2 = []
 
-            # Only set original_df to df2 if it wasn't already set from df1 and df2 is valid
-            if st.session_state.get('original_df') is None and not df2.empty:
-                st.session_state['original_df'] = df2.copy()
+                # If either file has multiple sheets, allow per-file sheet selection laid out side-by-side
+                if sheets or sheets2:
+                    sheet_col1, sheet_col2 = st.columns(2)
+                    with sheet_col1:
+                        if sheets:
+                            sel1 = st.selectbox("Select sheet for File 1", sheets, index=0, key="file1_sheet_select")
+                        else:
+                            sel1 = None
+                    with sheet_col2:
+                        if sheets2:
+                            sel2 = st.selectbox("Select sheet for File 2", sheets2, index=0, key="file2_sheet_select")
+                        else:
+                            sel2 = None
+                else:
+                    sel1 = sel2 = None
 
-            # Column selection UI for two files
-            st.markdown("<b>Select columns to compare:</b>", unsafe_allow_html=True)
-            col_file1, col_file2 = st.columns(2)
-            with col_file1:
-                st.markdown("<b>File 1</b>", unsafe_allow_html=True)
-                col1_q, col1_a = st.columns(2)
-                with col1_q:
-                    col1_q_val = st.selectbox("Question", df1.columns, index=0, key="file1_q_sel", help="Select the question column in File 1")
-                with col1_a:
-                    col1_a_val = st.selectbox("Answer (File 1)", df1.columns, index=1, key="file1_a_sel", help="Select the answer column in File 1")
-            with col_file2:
-                st.markdown("<b>File 2</b>", unsafe_allow_html=True)
-                col2_q, col2_a = st.columns(2)
-                with col2_q:
-                    col2_q_val = st.selectbox("Question", df2.columns, index=0, key="file2_q_sel", help="Select the question column in File 2")
-                with col2_a:
-                    col2_a_val = st.selectbox("Answer (File 2)", df2.columns, index=1, key="file2_a_sel", help="Select the answer column in File 2")
+                # Re-read the files using chosen sheets (if any)
+                df1 = read_uploaded_file(uploaded_file1, sheet_name=sel1 if sel1 else None)
+                df2 = read_uploaded_file(uploaded_file2, sheet_name=sel2 if sel2 else None)
+
+                # Validate read results
+                if df1 is None or not hasattr(df1, 'columns'):
+                    st.error("Could not read File 1. Please check the file and re-upload.")
+                    df1 = pd.DataFrame()
+                    skip_file_read = True
+                if df2 is None or not hasattr(df2, 'columns'):
+                    st.error("Could not read File 2. Please check the file and re-upload.")
+                    df2 = pd.DataFrame()
+                    skip_file_read = True
+
+                # Only set original_df to df2 if it wasn't already set from df1 and df2 is valid
+                if st.session_state.get('original_df') is None and not df2.empty:
+                    st.session_state['original_df'] = df2.copy()
+
+                if not skip_file_read:
+                    file1_is_spreadsheet = _is_spreadsheet_upload(uploaded_file1)
+                    file2_is_spreadsheet = _is_spreadsheet_upload(uploaded_file2)
+
+                    if file1_is_spreadsheet or file2_is_spreadsheet:
+                        st.markdown("<b>Select columns to compare:</b>", unsafe_allow_html=True)
+                    else:
+                        st.info(
+                            "Document/text uploads are mapped automatically using the extracted "
+                            "`Section` and `Content` fields, then aligned by best text match before scoring."
+                        )
+
+                    col_file1, col_file2 = st.columns(2)
+                    with col_file1:
+                        st.markdown("<b>File 1</b>", unsafe_allow_html=True)
+                        if file1_is_spreadsheet:
+                            col1_q, col1_a = st.columns(2)
+                            with col1_q:
+                                col1_q_val = st.selectbox("Question", df1.columns, index=0, key="file1_q_sel", help="Select the question column in File 1")
+                            with col1_a:
+                                col1_a_val = st.selectbox("Answer (File 1)", df1.columns, index=1, key="file1_a_sel", help="Select the answer column in File 1")
+                        else:
+                            col1_q_val, col1_a_val = _default_compare_columns(df1)
+                            st.caption(f"Using extracted fields automatically: `{col1_q_val}` and `{col1_a_val}`")
+                    with col_file2:
+                        st.markdown("<b>File 2</b>", unsafe_allow_html=True)
+                        if file2_is_spreadsheet:
+                            col2_q, col2_a = st.columns(2)
+                            with col2_q:
+                                col2_q_val = st.selectbox("Question", df2.columns, index=0, key="file2_q_sel", help="Select the question column in File 2")
+                            with col2_a:
+                                col2_a_val = st.selectbox("Answer (File 2)", df2.columns, index=1, key="file2_a_sel", help="Select the answer column in File 2")
+                        else:
+                            col2_q_val, col2_a_val = _default_compare_columns(df2)
+                            st.caption(f"Using extracted fields automatically: `{col2_q_val}` and `{col2_a_val}`")
         else:
             df2 = df1
             if df1.shape[1] < 3:
@@ -2212,6 +3176,15 @@ if uploaded_file1:
                     f"2. Use Excel to open and re-save as CSV (UTF-8)\n"
                     f"3. If using Excel, try saving as .xlsx format instead\n\n"
                     f"Technical details: {error_msg}")
+        elif "scanned or image-only" in error_msg.lower() or "no selectable text could be extracted" in error_msg.lower():
+            st.error(
+                "**PDF Text Extraction Error**: This PDF looks like a scanned/image-only file, so the app could not extract text.\n\n"
+                "Try one of these:\n"
+                "1. Run OCR on the PDF, then upload it again\n"
+                "2. Export the PDF text into `.docx` or `.txt`\n"
+                "3. Use a text-based PDF instead of a scanned copy\n\n"
+                f"Technical details: {error_msg}"
+            )
         else:
             st.error(f"Error reading uploaded file(s): {error_msg}")
 
@@ -2315,7 +3288,7 @@ CROSS_ENCODER_MODELS = [
     "cross-encoder/ms-marco-MiniLM-L6-v2"
 ]
 
-def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=None, user_template=None, temperature=0.0, top_p=1.0, max_tokens=20, model_name=None):
+def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=None, user_template=None, temperature=0.0, top_p=1.0, max_tokens=20, model_name=None, question=None):
     """Call any AI provider for similarity matching."""
     from ai_providers import get_provider
 
@@ -2323,12 +3296,22 @@ def get_ai_similarity(provider_name, answer1, answer2, api_key, system_prompt=No
     prompt_template = _build_similarity_user_template(user_template)
     sys_content = _build_similarity_system_prompt(system_prompt)
     safe_max_tokens = max(16, int(max_tokens or 20))
+    prepared_answer1 = _prepare_answer_for_similarity(answer1)
+    prepared_answer2 = _prepare_answer_for_similarity(answer2)
+    prepared_question = _prepare_question_for_similarity(question)
 
     try:
         provider = get_provider(provider_name, api_key)
         score, explanation = provider.get_similarity(
-            answer1, answer2, sys_content, prompt_template,
-            temperature, top_p, safe_max_tokens, model_name=model_name
+            prepared_answer1,
+            prepared_answer2,
+            sys_content,
+            prompt_template,
+            temperature,
+            top_p,
+            safe_max_tokens,
+            model_name=model_name,
+            question=prepared_question,
         )
         if score is None:
             return None, (explanation or "Provider returned no score.")
@@ -2359,8 +3342,8 @@ def _notify_local_backend(main_model):
 
 
 # Legacy function for backward compatibility
-def get_gpt4o_similarity(answer1, answer2, api_key, system_prompt=None, user_template=None, temperature=0.0, top_p=1.0, max_tokens=20):
-    return get_ai_similarity("Azure OpenAI GPT-4o", answer1, answer2, api_key, system_prompt, user_template, temperature, top_p, max_tokens)
+def get_gpt4o_similarity(answer1, answer2, api_key, system_prompt=None, user_template=None, temperature=0.0, top_p=1.0, max_tokens=20, question=None):
+    return get_ai_similarity("Azure OpenAI GPT-4o", answer1, answer2, api_key, system_prompt, user_template, temperature, top_p, max_tokens, question=question)
 
 # Determine if columns have been selected
 cols_selected = False
@@ -2414,23 +3397,26 @@ if compare_clicked:
     
     import re, string
     import difflib
-    # Lazy import of sentence_transformers only when needed. If not installed, handle gracefully.
-    try:
-        import importlib
-        st_mod = importlib.import_module('sentence_transformers')
-        SentenceTransformer = getattr(st_mod, 'SentenceTransformer', None)
-        util = getattr(st_mod, 'util', None)
-        if util is None:
+    SentenceTransformer = None
+    util = _FallbackUtil()
+    CrossEncoder = None
+    # Import local-model dependencies only when the Local Model path is actually used.
+    if matching_method == "Local Model":
+        try:
+            import importlib
+            st_mod = importlib.import_module('sentence_transformers')
+            SentenceTransformer = getattr(st_mod, 'SentenceTransformer', None)
+            util = getattr(st_mod, 'util', None)
+            if util is None:
+                util = _FallbackUtil()
+        except Exception:
+            SentenceTransformer = None
             util = _FallbackUtil()
-    except Exception:
-        SentenceTransformer = None
-        util = _FallbackUtil()
-    try:
-        CrossEncoder = None
-        ce_mod = importlib.import_module('sentence_transformers.cross_encoder')
-        CrossEncoder = getattr(ce_mod, 'CrossEncoder', None)
-    except Exception:
-        CrossEncoder = None
+        try:
+            ce_mod = importlib.import_module('sentence_transformers.cross_encoder')
+            CrossEncoder = getattr(ce_mod, 'CrossEncoder', None)
+        except Exception:
+            CrossEncoder = None
     # --- 3.1: Column Selection and Validation (use earlier selections) ---
     try:
         with st.spinner("Loading models and processing files..."):
@@ -2494,6 +3480,7 @@ if compare_clicked:
 
                     def aggressive_clean(ans):
                         ans = clean_answer(ans)
+                        ans = _prepare_answer_for_similarity(ans)
                         # Preserve numeric tokens so "25" vs "70" are not treated as identical.
                         context_phrases = [
                             r'based on the provided context', r'from the context', r'from context', r'context', r'see context',
@@ -2504,17 +3491,58 @@ if compare_clicked:
                         ans = re.sub(r'\s+', ' ', ans)
                         return ans.strip()
 
-                    # Normalize lengths
-                    min_len = min(len(questions1), len(questions2), len(answers1), len(answers2))
-                    questions1 = questions1[:min_len]
-                    questions2 = questions2[:min_len]
-                    answers1 = answers1[:min_len]
-                    answers2 = answers2[:min_len]
+                    use_best_match_alignment = _should_use_best_match_alignment(
+                        comparison_mode,
+                        uploaded_file1,
+                        uploaded_file2,
+                    )
+                    alignment_rows = None
+                    alignment_seed_scores = []
+
+                    if use_best_match_alignment:
+                        alignment_rows = _build_best_match_alignment(
+                            questions1,
+                            answers1,
+                            questions2,
+                            answers2,
+                        )
+                        questions1 = [row["question1"] for row in alignment_rows]
+                        answers1 = [row["answer1"] for row in alignment_rows]
+                        questions2 = [row["question2"] for row in alignment_rows]
+                        answers2 = [row["answer2"] for row in alignment_rows]
+                        alignment_seed_scores = [row["alignment_seed_score"] for row in alignment_rows]
+                        min_len = len(alignment_rows)
+                    else:
+                        # Normalize lengths
+                        min_len = min(len(questions1), len(questions2), len(answers1), len(answers2))
+                        questions1 = questions1[:min_len]
+                        questions2 = questions2[:min_len]
+                        answers1 = answers1[:min_len]
+                        answers2 = answers2[:min_len]
 
                     cleaned1 = [aggressive_clean(a) for a in answers1]
                     cleaned2 = [aggressive_clean(a) for a in answers2]
                     cleaned1 = list(map(str, cleaned1))
                     cleaned2 = list(map(str, cleaned2))
+                    prepared_answers1 = [_prepare_answer_for_similarity(a) for a in answers1]
+                    prepared_answers2 = [_prepare_answer_for_similarity(a) for a in answers2]
+                    use_question_context = _should_use_question_context(
+                        comparison_mode,
+                        uploaded_file1,
+                        uploaded_file2,
+                    )
+                    question_contexts = [
+                        _prepare_question_for_similarity(q) if use_question_context else ""
+                        for q in questions1
+                    ]
+                    semantic_texts1 = [
+                        f"Question: {q}\nAnswer: {a}" if q else a
+                        for q, a in zip(question_contexts, cleaned1)
+                    ]
+                    semantic_texts2 = [
+                        f"Question: {q}\nAnswer: {a}" if q else a
+                        for q, a in zip(question_contexts, cleaned2)
+                    ]
 
                     explanations = [""] * min_len
 
@@ -2523,7 +3551,7 @@ if compare_clicked:
                         gpt_scores = []
                         gpt_explanations = []
                         progress = st.progress(0, text=f"Comparing answers with {matching_method}...")
-                        for idx, (a1, a2) in enumerate(zip(answers1, answers2)):
+                        for idx, (a1, a2, q_ctx) in enumerate(zip(answers1, answers2, question_contexts)):
                             if st.session_state.get("cancel_requested", False):
                                 st.info("Comparison cancelled by user.")
                                 break
@@ -2551,6 +3579,7 @@ if compare_clicked:
                                     top_p=top_p,
                                     max_tokens=max_tokens,
                                     model_name=provider_model_name,
+                                    question=q_ctx,
                                 )
                                 if score is None:
                                     raise RuntimeError(
@@ -2599,8 +3628,8 @@ if compare_clicked:
                                         st.info("Comparison cancelled by user.")
                                         break
                                     end = min(i + chunk_size, n)
-                                    emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
-                                    emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
+                                    emb1 = main_model.encode(semantic_texts1[i:end], convert_to_tensor=True)
+                                    emb2 = main_model.encode(semantic_texts2[i:end], convert_to_tensor=True)
                                     sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
                                     sims.extend(sim_chunk.tolist())
                                     raw_sims.extend(sim_chunk.round(4).tolist())
@@ -2614,7 +3643,7 @@ if compare_clicked:
                                 cross_scores = None
                                 if cross_encoder is not None:
                                     try:
-                                        pairs = list(zip(cleaned1, cleaned2))
+                                        pairs = list(zip(semantic_texts1, semantic_texts2))
                                         cross_sim_list = []
                                         for i in range(0, n, chunk_size):
                                             if st.session_state.get("cancel_requested", False):
@@ -2642,7 +3671,7 @@ if compare_clicked:
                             def fuzzy_ratio(a, b):
                                 return int(SequenceMatcher(None, a, b).ratio() * 100)
                             fuzzy_scores = [fuzzy_ratio(a1, a2) for a1, a2 in zip(cleaned1, cleaned2)]
-                            lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(answers1, answers2)]
+                            lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(prepared_answers1, prepared_answers2)]
                             if cross_encoder is not None and cross_scores is not None:
                                 final_percent_sim = cross_scores
                             else:
@@ -2656,7 +3685,7 @@ if compare_clicked:
                             raw_sim = [None] * min_len
                             fuzzy_scores = [None] * min_len
 
-                    final_percent_sim = _calibrate_similarity_series(final_percent_sim, answers1, answers2)
+                    final_percent_sim = _calibrate_similarity_series(final_percent_sim, prepared_answers1, prepared_answers2)
 
                     match_quality = [
                         "High" if s and s > threshold else ("Medium" if s and s > 60 else "Low")
@@ -2695,35 +3724,66 @@ if compare_clicked:
                     if q_col_name == a1_col_name or q_col_name == a2_col_name:
                         q_col_name = f"{q_col_name} (Question)"
 
+                    q2_col_name = col2_q_val if col2_q_val is not None else "Question 2"
+                    if q2_col_name == q_col_name:
+                        q2_col_name = f"{q2_col_name} (File 2)"
+                    if q2_col_name == a1_col_name or q2_col_name == a2_col_name:
+                        q2_col_name = f"{q2_col_name} (Match)"
+
                     sim_col_name = f"{a1_col_name} & {a2_col_name} Similarity"
 
-                    results_df = pd.DataFrame({
+                    results_payload = {
                         q_col_name: questions1,
                         a1_col_name: answers1,
-                        a2_col_name: answers2,
-                        "Source File 1": file1_name,
-                        "Source Sheet 1": sheet1_name,
-                        "Source File 2": file2_name,
-                        "Source Sheet 2": sheet2_name,
-                        sim_col_name: final_percent_sim
-                    })
+                    }
+                    if use_best_match_alignment:
+                        results_payload[q2_col_name] = questions2
+                    results_payload.update(
+                        {
+                            a2_col_name: answers2,
+                            "Source File 1": file1_name,
+                            "Source Sheet 1": sheet1_name,
+                            "Source File 2": file2_name,
+                            "Source Sheet 2": sheet2_name,
+                            sim_col_name: final_percent_sim,
+                        }
+                    )
+                    if use_best_match_alignment:
+                        results_payload["Alignment Strategy"] = ["Best text match"] * len(final_percent_sim)
+                        results_payload["Initial Alignment Score"] = alignment_seed_scores
+
+                    results_df = pd.DataFrame(results_payload)
 
                     st.session_state['results_df'] = results_df.copy()
                     st.session_state['similarity_cols'] = [sim_col_name]
                     st.session_state['primary_sim_col'] = sim_col_name
 
-                    st.session_state['diff_table'] = pd.DataFrame({
+                    diff_payload = {
                         q_col_name: questions1,
                         f"{a1_col_name} (diff)": diff1,
-                        f"{a2_col_name} (diff)": diff2,
-                        "Source File 1": file1_name,
-                        "Source Sheet 1": sheet1_name,
-                        "Source File 2": file2_name,
-                        "Source Sheet 2": sheet2_name,
-                        sim_col_name: final_percent_sim
-                    }).copy()
+                    }
+                    if use_best_match_alignment:
+                        diff_payload[q2_col_name] = questions2
+                    diff_payload.update(
+                        {
+                            f"{a2_col_name} (diff)": diff2,
+                            "Source File 1": file1_name,
+                            "Source Sheet 1": sheet1_name,
+                            "Source File 2": file2_name,
+                            "Source Sheet 2": sheet2_name,
+                            sim_col_name: final_percent_sim,
+                        }
+                    )
+                    if use_best_match_alignment:
+                        diff_payload["Alignment Strategy"] = ["Best text match"] * len(final_percent_sim)
+                        diff_payload["Initial Alignment Score"] = alignment_seed_scores
 
-                    st.success(f"Compared {min_len} question-answer pairs.")
+                    st.session_state['diff_table'] = pd.DataFrame(diff_payload).copy()
+
+                    if use_best_match_alignment:
+                        st.success(f"Compared {min_len} aligned text chunks using best-match pairing.")
+                    else:
+                        st.success(f"Compared {min_len} question-answer pairs.")
                 else:
                     df2 = df1
                     # New mode: compare one base column with two target columns (no changes to other modes)
@@ -2759,6 +3819,7 @@ if compare_clicked:
 
                         def aggressive_clean(ans):
                             ans = clean_answer(ans)
+                            ans = _prepare_answer_for_similarity(ans)
                             # Preserve numeric tokens so quantity/value columns compare correctly.
                             context_phrases = [
                                 r'based on the provided context', r'from the context', r'from context', r'context', r'see context',
@@ -2775,6 +3836,9 @@ if compare_clicked:
                         cleaned_base = list(map(str, cleaned_base))
                         cleaned_a = list(map(str, cleaned_a))
                         cleaned_b = list(map(str, cleaned_b))
+                        prepared_base = [_prepare_answer_for_similarity(a) for a in base_vals]
+                        prepared_target_a = [_prepare_answer_for_similarity(a) for a in target_a_vals]
+                        prepared_target_b = [_prepare_answer_for_similarity(a) for a in target_b_vals]
 
                         explanations = [""] * min_len
 
@@ -2965,8 +4029,8 @@ if compare_clicked:
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
                                 fuzzy_a = [fuzzy_ratio(a,b) for a,b in zip(cleaned_base, cleaned_a)]
                                 fuzzy_b = [fuzzy_ratio(a,b) for a,b in zip(cleaned_base, cleaned_b)]
-                                lexical_a = [_lexical_similarity_percent(a, b) for a, b in zip(base_vals, target_a_vals)]
-                                lexical_b = [_lexical_similarity_percent(a, b) for a, b in zip(base_vals, target_b_vals)]
+                                lexical_a = [_lexical_similarity_percent(a, b) for a, b in zip(prepared_base, prepared_target_a)]
+                                lexical_b = [_lexical_similarity_percent(a, b) for a, b in zip(prepared_base, prepared_target_b)]
                                 final_percent_sim_a = [
                                     max(float(mpnet), float(fuzz), float(lex))
                                     for mpnet, fuzz, lex in zip(cross_scores_a, fuzzy_a, lexical_a)
@@ -2983,8 +4047,8 @@ if compare_clicked:
                                 raw_sim_a = [None] * min_len
                                 raw_sim_b = [None] * min_len
 
-                        final_percent_sim_a = _calibrate_similarity_series(final_percent_sim_a, base_vals, target_a_vals)
-                        final_percent_sim_b = _calibrate_similarity_series(final_percent_sim_b, base_vals, target_b_vals)
+                        final_percent_sim_a = _calibrate_similarity_series(final_percent_sim_a, prepared_base, prepared_target_a)
+                        final_percent_sim_b = _calibrate_similarity_series(final_percent_sim_b, prepared_base, prepared_target_b)
 
                         match_quality_a = ["High" if s and s > threshold else ("Medium" if s and s > 60 else "Low") for s in final_percent_sim_a]
                         match_quality_b = ["High" if s and s > threshold else ("Medium" if s and s > 60 else "Low") for s in final_percent_sim_b]
@@ -3093,6 +4157,7 @@ if compare_clicked:
 
                         def aggressive_clean(ans):
                             ans = clean_answer(ans)
+                            ans = _prepare_answer_for_similarity(ans)
                             # Preserve numeric tokens so quantity/value columns compare correctly.
                             context_phrases = [
                                 r'based on the provided context', r'from the context', r'from context', r'context', r'see context', r'as per context', r'per context', r'per the context', r'per the provided context', r'provided context', r'according to'
@@ -3106,6 +4171,17 @@ if compare_clicked:
                         cleaned2 = [aggressive_clean(a) for a in answers2]
                         cleaned1 = list(map(str, cleaned1))
                         cleaned2 = list(map(str, cleaned2))
+                        prepared_answers1 = [_prepare_answer_for_similarity(a) for a in answers1]
+                        prepared_answers2 = [_prepare_answer_for_similarity(a) for a in answers2]
+                        question_contexts = [_prepare_question_for_similarity(q) for q in questions1]
+                        semantic_texts1 = [
+                            f"Question: {q}\nAnswer: {a}" if q else a
+                            for q, a in zip(question_contexts, cleaned1)
+                        ]
+                        semantic_texts2 = [
+                            f"Question: {q}\nAnswer: {a}" if q else a
+                            for q, a in zip(question_contexts, cleaned2)
+                        ]
 
                         explanations = [""] * min_len
 
@@ -3113,7 +4189,7 @@ if compare_clicked:
                             gpt_scores = []
                             gpt_explanations = []
                             progress = st.progress(0, text=f"Comparing answers with {matching_method}...")
-                            for idx, (a1, a2) in enumerate(zip(answers1, answers2)):
+                            for idx, (a1, a2, q_ctx) in enumerate(zip(answers1, answers2, question_contexts)):
                                 if st.session_state.get("cancel_requested", False):
                                     st.info("Comparison cancelled by user.")
                                     break
@@ -3141,6 +4217,7 @@ if compare_clicked:
                                         top_p=top_p,
                                         max_tokens=max_tokens,
                                         model_name=provider_model_name,
+                                        question=q_ctx,
                                     )
                                     if score is None:
                                         raise RuntimeError(
@@ -3190,8 +4267,8 @@ if compare_clicked:
                                             st.info("Comparison cancelled by user.")
                                             break
                                         end = min(i + chunk_size, n)
-                                        emb1 = main_model.encode(cleaned1[i:end], convert_to_tensor=True)
-                                        emb2 = main_model.encode(cleaned2[i:end], convert_to_tensor=True)
+                                        emb1 = main_model.encode(semantic_texts1[i:end], convert_to_tensor=True)
+                                        emb2 = main_model.encode(semantic_texts2[i:end], convert_to_tensor=True)
                                         sim_chunk = util.cos_sim(emb1, emb2).diagonal().cpu().numpy()
                                         sims.extend(sim_chunk.tolist())
                                         raw_sims.extend(sim_chunk.round(4).tolist())
@@ -3207,7 +4284,7 @@ if compare_clicked:
                                     cross_scores = None
                                     if cross_encoder is not None:
                                         try:
-                                            pairs = list(zip(cleaned1, cleaned2))
+                                            pairs = list(zip(semantic_texts1, semantic_texts2))
                                             cross_sim_list = []
                                             for i in range(0, n, chunk_size):
                                                 if st.session_state.get("cancel_requested", False):
@@ -3234,7 +4311,7 @@ if compare_clicked:
                                 def fuzzy_ratio(a, b):
                                     return int(SequenceMatcher(None, a, b).ratio() * 100)
                                 fuzzy_scores = [fuzzy_ratio(a, b) for a, b in zip(cleaned1, cleaned2)]
-                                lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(answers1, answers2)]
+                                lexical_scores = [_lexical_similarity_percent(a1, a2) for a1, a2 in zip(prepared_answers1, prepared_answers2)]
                                 if not isinstance(main_model, _FallbackSentenceModel) and cross_encoder is not None and cross_scores is not None:
                                     final_percent_sim = cross_scores
                                 else:
@@ -3248,7 +4325,7 @@ if compare_clicked:
                                 raw_sim = [None] * min_len
                                 fuzzy_scores = [None] * min_len
 
-                        final_percent_sim = _calibrate_similarity_series(final_percent_sim, answers1, answers2)
+                        final_percent_sim = _calibrate_similarity_series(final_percent_sim, prepared_answers1, prepared_answers2)
 
                         match_quality = [
                             "High" if s and s > threshold else ("Medium" if s and s > 60 else "Low")
@@ -3492,7 +4569,7 @@ if compare_clicked:
 
         with st.expander("Show full results table", expanded=False):
             st.markdown("**Full Results Table:**")
-            st.dataframe(results_df, use_container_width=True)
+            st.dataframe(results_df, width="stretch")
 
         # Download options (drop source metadata)
         st.markdown("### Download Options")
@@ -3954,6 +5031,72 @@ if compare_clicked:
                 )
             else:
                 st.info("No results below 50%")
+
+        has_non_spreadsheet_input = (
+            comparison_mode == "Compare Any Two Files"
+            and (
+                (uploaded_file1 is not None and not _is_spreadsheet_upload(uploaded_file1))
+                or (uploaded_file2 is not None and not _is_spreadsheet_upload(uploaded_file2))
+            )
+        )
+        if has_non_spreadsheet_input:
+            alt_export_df = results_df.drop(columns=[c for c in results_df.columns if "(diff)" in str(c)], errors="ignore")
+            alt_display_df = _build_non_excel_export_df(alt_export_df)
+            alt_summary = _build_export_summary(
+                results_df,
+                threshold,
+                st.session_state.get('primary_sim_col'),
+            )
+            alt_base_filename = ''
+            if uploaded_file1 is not None:
+                alt_base_filename = uploaded_file1.name.rsplit('.', 1)[0]
+            elif uploaded_file2 is not None:
+                alt_base_filename = uploaded_file2.name.rsplit('.', 1)[0]
+            else:
+                alt_base_filename = 'exported_results'
+
+            csv_bytes = alt_display_df.to_csv(index=False).encode('utf-8-sig')
+            json_payload = _build_non_excel_json_payload(
+                alt_export_df,
+                alt_summary,
+                uploaded_file1=uploaded_file1,
+                uploaded_file2=uploaded_file2,
+            )
+            html_payload = _build_non_excel_html_payload(
+                alt_display_df,
+                alt_summary,
+                f"{alt_base_filename} Similarity Report",
+            )
+
+            st.markdown("#### Additional Exports For Non-Spreadsheet Inputs")
+            alt_col1, alt_col2, alt_col3 = st.columns(3)
+            with alt_col1:
+                st.download_button(
+                    label="CSV Report",
+                    data=csv_bytes,
+                    file_name=f"{alt_base_filename}_similarity.csv",
+                    mime="text/csv",
+                    help="Download the results table as CSV.",
+                    key="download_non_excel_csv_state",
+                )
+            with alt_col2:
+                st.download_button(
+                    label="JSON Report",
+                    data=json_payload,
+                    file_name=f"{alt_base_filename}_similarity.json",
+                    mime="application/json",
+                    help="Download the results plus summary metadata as JSON.",
+                    key="download_non_excel_json_state",
+                )
+            with alt_col3:
+                st.download_button(
+                    label="HTML Report",
+                    data=html_payload,
+                    file_name=f"{alt_base_filename}_similarity.html",
+                    mime="text/html",
+                    help="Download a readable HTML report for PDF/TXT/DOC-style comparisons.",
+                    key="download_non_excel_html_state",
+                )
 else:
     if IS_TWO_FILE_MODE:
         st.info("Please upload both files to begin.")

@@ -22,6 +22,7 @@ def _load_similarity_namespace():
         "SIMILARITY_CONTEXT_PHRASES",
         "SIMILARITY_ABSTENTION_PATTERNS",
         "SIMILARITY_NEGATION_TOKENS",
+        "SIMILARITY_STRONG_NEGATION_TOKENS",
         "SIMILARITY_TRUE_TOKENS",
         "SIMILARITY_FALSE_TOKENS",
         "SIMILARITY_STOPWORDS",
@@ -201,6 +202,27 @@ def test_detect_similarity_conflicts_allows_equivalent_unit_conversions():
     assert conflicts["unit_mismatch"] is False
 
 
+def test_conflict_detectors_avoid_false_flags_for_long_descriptive_answers():
+    row_a = (
+        "The eFare system includes field devices, workstations, vehicle-installed devices, mobile devices, and central infrastructure."
+    )
+    row_b = (
+        "The PROXmobil3 validator communicates via the Mobile Access Router (MAR), and the TOUCHit3 MDT is used for vehicles without CAD/AVL integration."
+    )
+    conflicts = NS["_detect_similarity_conflicts"](row_a, row_b)
+    assert conflicts["negation_mismatch"] is False
+    assert conflicts["date_mismatch"] is False
+
+    ui_a = (
+        "The interface allows users to manage orders, search orders, review order details, and navigate between screens."
+    )
+    ui_b = (
+        "The web-based interface includes login, permissions, sorting, grouping, filtering, and navigation options shown in the orders screens."
+    )
+    ui_conflicts = NS["_detect_similarity_conflicts"](ui_a, ui_b)
+    assert ui_conflicts["boolean_mismatch"] is False
+
+
 def test_balanced_calibration_caps_wrong_high_scores_and_boosts_matching_abstentions():
     negated = NS["_calibrate_similarity_score"](
         96,
@@ -236,6 +258,27 @@ def test_balanced_calibration_caps_wrong_high_scores_and_boosts_matching_abstent
         "The provided context does not describe the role in detail. It only indicates the role is included as a topic in the system administration course.",
     )
     assert partial_abstention >= 82.0
+
+    rescued_partial_abstention = NS["_calibrate_similarity_score"](
+        60,
+        "The role is not explicitly detailed in the provided context, but it is listed in the system administration course agenda.",
+        "The provided context does not describe the role in detail. It only indicates the role is included as a topic in the system administration course.",
+    )
+    assert rescued_partial_abstention >= 68.0
+
+    strong_paraphrase = NS["_calibrate_similarity_score"](
+        100,
+        "The reporting tool has Reports for report creation, Jobs for scheduled report jobs, Results for report outcomes, and Settings for configuration.",
+        "The main program groups are Reports to create and maintain reports, Jobs to manage scheduled report jobs, Results to administer report outcomes, and Settings to configure the tool.",
+    )
+    assert strong_paraphrase >= 92.0
+
+    strong_matching_abstention = NS["_calibrate_similarity_score"](
+        92,
+        "The provided context does not specify the maintenance interval for changing paper rolls.",
+        "The context does not state a maintenance schedule for paper roll replacement.",
+    )
+    assert strong_matching_abstention >= 90.0
 
 
 def test_non_excel_export_helpers_produce_expected_payloads():
@@ -342,6 +385,11 @@ def test_build_pdf_upload_dataframe_reports_scanned_pdf_clearly():
             raise AssertionError("Expected scanned PDF uploads to raise a helpful ValueError")
     finally:
         NS["_extract_pdf_text_pages"] = original
+
+
+
+
+
 
 
 

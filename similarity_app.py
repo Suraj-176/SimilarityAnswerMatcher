@@ -99,6 +99,18 @@ SIMILARITY_NEGATION_TOKENS = {
     "nor",
 }
 
+SIMILARITY_STRONG_NEGATION_TOKENS = {
+    "no",
+    "not",
+    "never",
+    "none",
+    "cannot",
+    "false",
+    "incorrect",
+    "neither",
+    "nor",
+}
+
 SIMILARITY_TRUE_TOKENS = {
     "yes",
     "true",
@@ -401,8 +413,8 @@ def _has_negation_mismatch(text1, text2):
         return False
     a_tokens = set(_normalize_similarity_text(text1).split())
     b_tokens = set(_normalize_similarity_text(text2).split())
-    a_has_negation = bool(a_tokens & SIMILARITY_NEGATION_TOKENS)
-    b_has_negation = bool(b_tokens & SIMILARITY_NEGATION_TOKENS)
+    a_has_negation = bool(a_tokens & SIMILARITY_STRONG_NEGATION_TOKENS)
+    b_has_negation = bool(b_tokens & SIMILARITY_STRONG_NEGATION_TOKENS)
     return a_has_negation != b_has_negation
 
 
@@ -416,14 +428,19 @@ def _extract_percent_tokens(text):
 
 
 def _extract_date_markers(text):
-    normalized = _normalize_similarity_text(text)
-    markers = set(re.findall(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", str(text or "").lower()))
-    markers.update(re.findall(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", str(text or "").lower()))
-    markers.update(token for token in normalized.split() if token in SIMILARITY_MONTH_TOKENS)
+    source = str(text or "").lower()
+    markers = set(re.findall(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", source))
+    markers.update(re.findall(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", source))
+    month_expr = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    markers.update(re.findall(rf"\b{month_expr}\s+\d{{1,2}}(?:,\s*\d{{2,4}})?\b", source))
+    markers.update(re.findall(rf"\b\d{{1,2}}\s+{month_expr}(?:\s+\d{{2,4}})?\b", source))
     return markers
 
 
 def _extract_boolean_label(text):
+    significant = _significant_tokens(text)
+    if len(significant) > 12:
+        return None
     tokens = set(_normalize_similarity_text(text).split())
     has_true = bool(tokens & SIMILARITY_TRUE_TOKENS)
     has_false = bool(tokens & SIMILARITY_FALSE_TOKENS)
@@ -541,14 +558,13 @@ def _detect_similarity_conflicts(text1, text2):
     quantity_relationships = _analyze_quantity_unit_relationships(text1, text2)
     residual_numeric_a = numeric_a - quantity_relationships["matched_numeric_tokens_a"]
     residual_numeric_b = numeric_b - quantity_relationships["matched_numeric_tokens_b"]
-    month_style_date_mismatch = bool(date_a and date_b and numeric_a and numeric_b and numeric_a != numeric_b)
 
     return {
         "negation_mismatch": _has_negation_mismatch(text1, text2),
         "boolean_mismatch": bool(bool_a and bool_b and bool_a != bool_b),
         "numeric_mismatch": bool(residual_numeric_a and residual_numeric_b and not (residual_numeric_a & residual_numeric_b)),
         "percent_mismatch": bool(percent_a and percent_b and not (percent_a & percent_b)),
-        "date_mismatch": bool((date_a and date_b and not (date_a & date_b)) or month_style_date_mismatch),
+        "date_mismatch": bool(date_a and date_b and not (date_a & date_b)),
         "unit_mismatch": quantity_relationships["unit_mismatch"],
         "abstention_mismatch": bool(abstain_a != abstain_b),
         "both_abstain": bool(abstain_a and abstain_b),
@@ -628,7 +644,26 @@ def _calibrate_similarity_score(score, text1, text2):
     if negation_mismatch:
         adjusted = min(adjusted, strict_score + 6.0, 62.0)
     if conflicts["both_abstain"] and not has_disjoint_numbers and not hard_value_conflict:
-        adjusted = max(adjusted, 88.0 if anchor_score >= 50.0 else 82.0)
+        if score_val >= 90.0 and overlap_ratio >= 0.4:
+            adjusted = max(adjusted, 94.0 if anchor_score >= 45.0 else 92.0)
+        else:
+            adjusted = max(adjusted, 88.0 if anchor_score >= 50.0 else 82.0)
+    if not hard_value_conflict and not negation_mismatch:
+        if (
+            shared_fact_abstention
+            and adjusted < 68.0
+            and overlap_ratio >= 0.55
+            and (anchor_score >= 25.0 or score_val >= 60.0)
+        ):
+            adjusted = max(adjusted, 72.0 if overlap_ratio >= 0.68 and anchor_score >= 32.0 else 68.0)
+        elif (
+            not conflicts["abstention_mismatch"]
+            and not conflicts["both_abstain"]
+            and adjusted < 66.0
+            and overlap_ratio >= 0.72
+            and anchor_score >= 30.0
+        ):
+            adjusted = max(adjusted, 68.0)
 
     # Partial-answer risk: one answer is much longer, with limited shared content.
     sig_a = _significant_tokens(text1)
@@ -645,15 +680,40 @@ def _calibrate_similarity_score(score, text1, text2):
 
     # Balanced high-score gate: allow 90+ only for strong semantic agreement with no conflicts.
     has_conflict = any(conflicts.values())
-    allow_ninety_plus = (
+    semantic_high_equivalence = (
         not has_conflict
+        and length_ratio <= 3.6
         and (
-            strict_a == strict_b
-            or (relaxed_a == relaxed_b and not has_disjoint_numbers)
-            or (short_subset_match and score_val >= 88.0 and overlap_ratio >= 0.5)
-            or (score_val >= 92.0 and anchor_score >= 84.0 and overlap_ratio >= 0.5)
-            or (score_val >= 95.0 and anchor_score >= 80.0 and overlap_ratio >= 0.4)
+            (score_val >= 96.0 and overlap_ratio >= 0.68)
+            or (score_val >= 94.0 and overlap_ratio >= 0.75)
+            or (score_val >= 92.0 and overlap_ratio >= 0.82)
+            or (short_subset_match and score_val >= 90.0 and overlap_ratio >= 0.58)
         )
+    )
+    if semantic_high_equivalence:
+        adjusted = max(adjusted, min(score_val, 96.0 if overlap_ratio >= 0.85 else 94.0))
+
+    both_abstain_high_equivalence = (
+        conflicts["both_abstain"]
+        and not has_disjoint_numbers
+        and not hard_value_conflict
+        and score_val >= 90.0
+        and overlap_ratio >= 0.4
+        and length_ratio <= 3.2
+    )
+    allow_ninety_plus = (
+        (
+            not has_conflict
+            and (
+                strict_a == strict_b
+                or (relaxed_a == relaxed_b and not has_disjoint_numbers)
+                or semantic_high_equivalence
+                or (short_subset_match and score_val >= 88.0 and overlap_ratio >= 0.5)
+                or (score_val >= 92.0 and anchor_score >= 84.0 and overlap_ratio >= 0.5)
+                or (score_val >= 95.0 and anchor_score >= 80.0 and overlap_ratio >= 0.4)
+            )
+        )
+        or both_abstain_high_equivalence
     )
     if adjusted > 90.0 and not allow_ninety_plus:
         adjusted = min(adjusted, 89.0)
